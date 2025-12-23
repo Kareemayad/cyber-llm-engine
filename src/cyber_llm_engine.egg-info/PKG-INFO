@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: cyber-llm-engine
+Version: 0.1.0
+Summary: Modular LLM engine for cybersecurity (Phase 1: MITRE Expert)
+Requires-Python: >=3.10
