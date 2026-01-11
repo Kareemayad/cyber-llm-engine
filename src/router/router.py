@@ -1,8 +1,9 @@
 # src/router/router.py
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
-from typing import List, Literal
+from typing import List, Literal, Optional
 
 
 RouteKind = Literal[
@@ -19,20 +20,46 @@ class RouteDecision:
     reasons: List[str]
 
 
-def route_query(query: str) -> RouteDecision:
+# Proper MITRE technique ID pattern: T#### or T####.###
+TECHID_RE = re.compile(r"\bT\d{4}(?:\.\d{3})?\b", re.IGNORECASE)
+
+
+def route_query(
+    query: str,
+    dataset: Optional[str] = None,
+    mode: Optional[str] = None,
+) -> RouteDecision:
     """
-    Very simple rule-based router for v1.
+    Simple rule-based router for v1.
 
     Decides which MITRE specialist(s) to call:
       - docqa
       - mapper
       - detect
       - mapper_detect
+
+    Notes:
+    - dataset/mode are optional hints (so you can pass them from the API router).
+      Today this router is MITRE-focused; for non-MITRE datasets the API router
+      should override and use retrieval-only behavior (as we implemented).
     """
-    q = (query or "").lower()
+    q_raw = query or ""
+    q = q_raw.lower()
     reasons: List[str] = []
 
-    # Strong signals for mapping/log-style queries
+    # Optional hints, useful for debugging / logging
+    if dataset:
+        reasons.append(f"dataset_hint={dataset}")
+    if mode:
+        reasons.append(f"mode_hint={mode}")
+
+    # --- Technique-id detection (REAL) ---
+    has_tech_id = bool(TECHID_RE.search(q_raw))
+    if has_tech_id:
+        reasons.append("mentions_tech_id")
+
+    # --- Strong signals for mapping/log-style queries ---
+    # Keep these relatively specific to avoid false positives.
     mapping_keywords = [
         "log ",
         "logs ",
@@ -43,39 +70,49 @@ def route_query(query: str) -> RouteDecision:
         "ioc",
         "indicator",
         "hash",
+        "sha256",
+        "md5",
         "ip ",
         "source ip",
         "destination ip",
+        "dst ip",
+        "src ip",
         "url ",
-        "connection",
-        "network flow",
+        "uri ",
+        "user-agent",
+        "dns ",
+        "http",
+        "https",
+        "proxy",
+        "firewall",
     ]
     has_mapping = any(kw in q for kw in mapping_keywords)
     if has_mapping:
         reasons.append("mapping_keywords")
 
-    # Strong signals for detection/rules-style queries
+    # --- Strong signals for detection/rules-style queries ---
     detect_keywords = [
         "how to detect",
         "how would you detect",
         "detect this",
         "detect ",
+        "detection",
         "sigma",
         "rule ",
         "rules ",
         "log source",
         "telemetry",
+        "analytic",
         "detection idea",
         "use case",
+        "hunting",
+        "hunt ",
     ]
     has_detect = any(kw in q for kw in detect_keywords)
     if has_detect:
         reasons.append("detect_keywords")
 
-    # Technique-id style query: very rough pattern (T#### / T####.###)
-    has_tech_id = "t1" in q or "t10" in q or "t15" in q or "t11" in q
-    if has_tech_id:
-        reasons.append("mentions_tech_id_like_pattern")
+    # Routing logic:
 
     # If it's clearly a detection question AND explicitly mentions a technique,
     # prefer MITRE-Detect directly.
@@ -84,15 +121,15 @@ def route_query(query: str) -> RouteDecision:
 
     # If clearly both mapping & detection but no explicit technique id:
     # use Mapper + Detect chain.
-    if has_mapping and has_detect:
+    if has_mapping and has_detect and not has_tech_id:
         return RouteDecision(kind="mapper_detect", reasons=reasons)
 
     # If looks like log/scenario → mapper
-    if has_mapping:
+    if has_mapping and not has_detect:
         return RouteDecision(kind="mapper", reasons=reasons)
 
     # If asks about detection but not obviously a log → detect
-    if has_detect:
+    if has_detect and not has_mapping:
         return RouteDecision(kind="detect", reasons=reasons)
 
     # Default: DocQA

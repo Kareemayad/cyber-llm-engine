@@ -1,34 +1,38 @@
 # src/mitre_expert/rag/index_chroma.py
-
 """
-Index MITRE chunks into ChromaDB with pluggable embedding backends.
+Index RAG chunks into ChromaDB with pluggable embedding backends.
 
-Inputs:
-    data/processed/mitre/mitre_chunks_v1.jsonl
+Supports multiple datasets:
+- MITRE ATT&CK chunks (mitre_chunks_v1.jsonl) -> collection "mitre_chunks_v1"
+- MITRE D3FEND chunks (d3fend_chunks_v1.jsonl) -> collection "d3fend_chunks_v1"
 
-Output (Chroma persistent DB):
-    data/embeddings/mitre/chroma/
-        -> collection: "mitre_chunks_v1"
+Control via env:
+  MITRE_INDEX_TARGET = "mitre" (default) | "d3fend" | "all"
+  MITRE_REINDEX_DROP = "true" (default) | "false"
 
 Embedding backends (select via env):
-    MITRE_EMBED_BACKEND:
-        - "hf"      -> HuggingFace sentence-transformers (default)
-        - "ollama"  -> Ollama local embeddings
+  MITRE_EMBED_BACKEND:
+    - "hf"      -> HuggingFace sentence-transformers (default)
+    - "ollama"  -> Ollama local embeddings
 
-    For HF:
-        MITRE_HF_EMBED_MODEL (default: "sentence-transformers/all-MiniLM-L6-v2")
+  For HF:
+    MITRE_HF_EMBED_MODEL (default: "sentence-transformers/all-MiniLM-L6-v2")
 
-    For Ollama:
-        MITRE_OLLAMA_EMBED_MODEL (default: "nomic-embed-text")
-        OLLAMA_BASE_URL (default: "http://localhost:11434")
+  For Ollama:
+    MITRE_OLLAMA_EMBED_MODEL (default: "nomic-embed-text")
+    OLLAMA_BASE_URL (default: "http://localhost:11434")
+
+Chroma persistent DB:
+  data/embeddings/mitre/chroma/
 """
 
 from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 import chromadb
 import requests
@@ -39,12 +43,29 @@ from chromadb.utils import embedding_functions
 # ---------------------------------------------------------------------------
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-
-CHUNKS_PATH = REPO_ROOT / "data/processed/mitre/mitre_chunks_v1.jsonl"
 DB_DIR = REPO_ROOT / "data/embeddings/mitre/chroma"
-
-COLLECTION_NAME = "mitre_chunks_v1"
 BATCH_SIZE = 64  # how many chunks per Chroma .add call
+
+
+@dataclass(frozen=True)
+class DatasetConfig:
+    key: str
+    chunks_path: Path
+    collection_name: str
+
+
+DATASETS: List[DatasetConfig] = [
+    DatasetConfig(
+        key="mitre",
+        chunks_path=REPO_ROOT / "data/processed/mitre/mitre_chunks_v1.jsonl",
+        collection_name="mitre_chunks_v1",
+    ),
+    DatasetConfig(
+        key="d3fend",
+        chunks_path=REPO_ROOT / "data/processed/mitre/d3fend_chunks_v1.jsonl",
+        collection_name="d3fend_chunks_v1",
+    ),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -221,68 +242,125 @@ def _sanitize_metadata(meta: Dict[str, Any]) -> Dict[str, Any]:
     return safe
 
 
-def _build_metadata_from_record(rec: Dict[str, Any]) -> Dict[str, Any]:
+def _build_metadata_from_record(rec: Dict[str, Any], dataset_key: str) -> Dict[str, Any]:
     """
-    JSONL records are flat (not nested under 'metadata').
-    We index important fields so we can filter deterministically at query time.
+    Build a metadata dict that works for BOTH MITRE and D3FEND chunk records.
+
+    MITRE fields we expect:
+      technique_id, technique_name, section, tactic_ids, tactic_names, platforms,
+      data_component_ids, log_source_names, mitigation_id, analytic_id, etc.
+
+    D3FEND fields we expect (from build_d3fend_chunks.py outputs):
+      d3fend_id, label/name, section, attack_ids / attack_technique_ids, relations, etc.
+
+    We store all "common" keys AND a few dataset-specific keys if present.
     """
     section = rec.get("section") or "unknown"
-    chunk_type = section  # compatibility with older code
+
+    # Common identifiers
+    chunk_id = rec.get("chunk_id") or rec.get("id")
+    source = rec.get("source") or (f"{dataset_key}_chunks_v1")
 
     meta_raw: Dict[str, Any] = {
-        "chunk_id": rec.get("chunk_id"),
-        "source": rec.get("source") or "mitre_chunks_v1",
-        "technique_id": rec.get("technique_id"),
-        "technique_name": rec.get("technique_name"),
+        "chunk_id": chunk_id,
+        "source": source,
+        "dataset": dataset_key,
         "section": section,
-        "chunk_type": chunk_type,
-        "type": chunk_type,
-        "mitigation_id": rec.get("mitigation_id"),
-        "mitigation_name": rec.get("mitigation_name"),
-        "analytic_id": rec.get("analytic_id"),
-        "analytic_name": rec.get("analytic_name"),
-        "procedure_source_id": rec.get("procedure_source_id"),
-        "procedure_source_name": rec.get("procedure_source_name"),
-        "procedure_source_type": rec.get("procedure_source_type"),
-        "tactic_ids": rec.get("tactic_ids"),
-        "tactic_names": rec.get("tactic_names"),
-        "platforms": rec.get("platforms"),
-        # telemetry enrichment
-        "data_component_ids": rec.get("data_component_ids"),
-        "log_source_names": rec.get("log_source_names"),
+        "chunk_type": section,
+        "type": section,
     }
+
+    # --- MITRE technique-centric metadata (if present)
+    for k in [
+        "technique_id",
+        "technique_name",
+        "tactic_ids",
+        "tactic_names",
+        "platforms",
+        "data_component_ids",
+        "log_source_names",
+        "mitigation_id",
+        "mitigation_name",
+        "analytic_id",
+        "analytic_name",
+        "procedure_source_id",
+        "procedure_source_name",
+        "procedure_source_type",
+    ]:
+        if k in rec:
+            meta_raw[k] = rec.get(k)
+
+    # --- D3FEND defense-centric metadata (if present)
+    # (your normalized + chunk scripts may use slightly different field names; we capture common variants)
+    for k in [
+        "d3fend_id",
+        "d3fend_uri",
+        "label",
+        "name",
+        "definition",
+        "attack_id",  # sometimes a single
+        "attack_ids",  # sometimes a list
+        "attack_technique_ids",
+        "attack_techniques",
+        "related_uris",
+        "related_ids",
+        "related_labels",
+        "relation_types",
+    ]:
+        if k in rec:
+            meta_raw[k] = rec.get(k)
+
     return _sanitize_metadata(meta_raw)
 
 
+def _parse_bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _select_datasets(target: str) -> List[DatasetConfig]:
+    t = (target or "mitre").strip().lower()
+    if t == "all":
+        return DATASETS
+    chosen = [d for d in DATASETS if d.key == t]
+    if not chosen:
+        valid = ", ".join(d.key for d in DATASETS) + ", all"
+        raise ValueError(f"Unknown MITRE_INDEX_TARGET={target!r}. Valid: {valid}")
+    return chosen
+
+
 # ---------------------------------------------------------------------------
-# Main indexing routine
+# Index one dataset
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
-    # 1) Prepare embedding function
-    embed_fn = get_embedding_function()
+def _index_dataset(
+    client: chromadb.PersistentClient,
+    dataset: DatasetConfig,
+    embed_fn: embedding_functions.EmbeddingFunction,
+    drop_existing: bool,
+) -> None:
+    chunks_path = dataset.chunks_path
+    collection_name = dataset.collection_name
 
-    # 2) Connect to Chroma
-    print(f"[index] Connecting to Chroma at {DB_DIR} ...")
-    DB_DIR.mkdir(parents=True, exist_ok=True)
-    client = chromadb.PersistentClient(path=str(DB_DIR))
+    print(f"\n[index] ===== Dataset: {dataset.key} =====")
+    print(f"[index] Input: {chunks_path}")
+    print(f"[index] Collection: {collection_name}")
 
-    # Drop & recreate collection for a clean reindex
-    try:
-        print(f"[index] Deleting existing collection '{COLLECTION_NAME}' ...")
-        client.delete_collection(name=COLLECTION_NAME)
-    except Exception:
-        print(f"[index] No existing collection '{COLLECTION_NAME}', creating fresh.")
+    if drop_existing:
+        try:
+            print(f"[index] Deleting existing collection '{collection_name}' ...")
+            client.delete_collection(name=collection_name)
+        except Exception:
+            print(f"[index] No existing collection '{collection_name}', creating fresh.")
 
     collection = client.get_or_create_collection(
-        name=COLLECTION_NAME,
+        name=collection_name,
         embedding_function=embed_fn,
         metadata={"hnsw:space": "cosine"},
     )
-
-    # 3) Stream & insert in batches
-    print(f"[index] Streaming chunks from {CHUNKS_PATH} in batches of {BATCH_SIZE} ...")
 
     seen_ids: set[str] = set()
     dup_count = 0
@@ -294,8 +372,8 @@ def main() -> None:
     batch_docs: List[str] = []
     batch_metas: List[Dict[str, Any]] = []
 
-    for idx, rec in enumerate(_load_chunks(CHUNKS_PATH)):
-        base_id = str(rec.get("id") or rec.get("chunk_id") or f"chunk_{idx}")
+    for idx, rec in enumerate(_load_chunks(chunks_path)):
+        base_id = str(rec.get("id") or rec.get("chunk_id") or f"{dataset.key}_chunk_{idx}")
 
         chunk_id = base_id
         if chunk_id in seen_ids:
@@ -316,17 +394,12 @@ def main() -> None:
             skipped_empty_text += 1
             continue
 
-        meta_safe = _build_metadata_from_record(rec)
+        meta_safe = _build_metadata_from_record(rec, dataset_key=dataset.key)
 
         # Chroma requires non-empty metadata dicts.
         if not meta_safe:
             empty_meta_fixed += 1
-            meta_safe = {
-                "source": "mitre_chunks_v1",
-                "technique_id": str(rec.get("technique_id") or "unknown"),
-                "section": str(rec.get("section") or "unknown"),
-                "chunk_type": str(rec.get("section") or "unknown"),
-            }
+            meta_safe = {"source": f"{dataset.key}_chunks_v1", "dataset": dataset.key, "section": "unknown"}
 
         batch_ids.append(chunk_id)
         batch_docs.append(text)
@@ -334,30 +407,44 @@ def main() -> None:
         total += 1
 
         if len(batch_ids) >= BATCH_SIZE:
-            collection.add(
-                ids=batch_ids,
-                documents=batch_docs,
-                metadatas=batch_metas,
-            )
+            collection.add(ids=batch_ids, documents=batch_docs, metadatas=batch_metas)
             print(f"[index] Inserted {total} chunks ...")
             batch_ids, batch_docs, batch_metas = [], [], []
 
-    # Flush any remaining partial batch
     if batch_ids:
-        collection.add(
-            ids=batch_ids,
-            documents=batch_docs,
-            metadatas=batch_metas,
-        )
+        collection.add(ids=batch_ids, documents=batch_docs, metadatas=batch_metas)
         print(f"[index] Inserted {total} chunks (final batch).")
 
-    print(f"[index] Indexed {total} unique chunks (deduplicated {dup_count} IDs).")
+    print(f"[index] DONE dataset={dataset.key} | indexed={total} | deduped_ids={dup_count}")
     if skipped_empty_text:
         print(f"[index] Skipped {skipped_empty_text} chunks with empty text.")
     if empty_meta_fixed:
         print(f"[index] Fixed {empty_meta_fixed} chunks that had empty metadata.")
 
-    print("[index] Done. All chunks inserted into Chroma.")
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    target = os.getenv("MITRE_INDEX_TARGET", "mitre")
+    drop_existing = _parse_bool_env("MITRE_REINDEX_DROP", default=True)
+
+    datasets = _select_datasets(target)
+
+    # 1) Prepare embedding function
+    embed_fn = get_embedding_function()
+
+    # 2) Connect to Chroma
+    print(f"[index] Connecting to Chroma at {DB_DIR} ...")
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+    client = chromadb.PersistentClient(path=str(DB_DIR))
+
+    # 3) Index selected dataset(s)
+    print(f"[index] Target={target!r} -> datasets={[d.key for d in datasets]} | drop_existing={drop_existing}")
+    for ds in datasets:
+        _index_dataset(client=client, dataset=ds, embed_fn=embed_fn, drop_existing=drop_existing)
 
 
 if __name__ == "__main__":

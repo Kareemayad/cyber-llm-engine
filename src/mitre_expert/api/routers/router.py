@@ -1,12 +1,13 @@
-# src/mitre_expert/api/routers/router.py
+#src/mitre_expert/api/routers/router.py
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from router.router import route_query
+
 from mitre_expert.llm.mitre_docqa import answer_mitre_docqa
 from mitre_expert.llm.mitre_mapper import (
     map_text_to_techniques,
@@ -14,42 +15,32 @@ from mitre_expert.llm.mitre_mapper import (
 )
 from mitre_expert.llm.mitre_detect import answer_mitre_detect
 from mitre_expert.llm.answer_composer import compose_answer
-from mitre_expert.rag.query_chroma import resolve_best_technique
-
-router = APIRouter(
-    prefix="/query",
-    tags=["router"],
+from mitre_expert.rag.query_chroma import (
+    resolve_best_technique,
+    search_chunks,
+    get_chunks,
 )
+
+router = APIRouter(prefix="/query", tags=["router"])
 
 
 class QueryRequest(BaseModel):
     query: str = Field(..., description="User question, log/alert, or CTI text.")
-    max_techniques: int = Field(
-        5,
-        ge=1,
-        le=10,
-        description="Maximum number of techniques to return from Mapper.",
-    )
-    technique_id: Optional[str] = Field(
-        None,
-        description=(
-            "Optional explicit technique_id for detection (e.g., T1059.001). "
-            "If not provided and Mapper is used, we take top technique; "
-            "for detect-only routes we try to resolve from the query."
-        ),
-    )
-    platform: Optional[str] = Field(
-        None,
-        description="Optional platform (e.g., Windows, Linux) for detection context.",
-    )
+
+    dataset: str = Field("mitre", description="Dataset to use: 'mitre' | 'd3fend' | 'all'.")
+    mode: str = Field("search", description="Retrieval mode: 'search' (semantic) | 'get' (deterministic by filter).")
+
+    technique_id: Optional[str] = Field(None, description="Optional explicit technique_id filter (MITRE-focused).")
+    section: Optional[str] = Field(None, description="Optional section filter (e.g., mitigation, description).")
+
+    max_techniques: int = Field(5, ge=1, le=10, description="Maximum number of techniques to return from Mapper.")
+    platform: Optional[str] = Field(None, description="Optional platform (e.g., Windows, Linux) for detection context.")
     available_logs: Optional[List[str]] = Field(
         default=None,
         description="Optional list of available log sources (e.g., Windows Security, Sysmon).",
     )
-    include_raw_sections: bool = Field(
-        True,
-        description="If true, include raw docqa/mapping/detection sections in the response.",
-    )
+    include_raw_sections: bool = Field(True, description="Include raw docqa/mapping/detection sections in response.")
+    topk: int = Field(8, ge=1, le=32, description="Number of chunks to retrieve.")
 
 
 class QueryResponse(BaseModel):
@@ -62,86 +53,128 @@ class QueryResponse(BaseModel):
     route_reasons: List[str]
 
 
+def _normalize_dataset(ds: str) -> str:
+    v = (ds or "mitre").strip().lower()
+    if v not in ("mitre", "d3fend", "all"):
+        raise HTTPException(status_code=400, detail="dataset must be one of: mitre | d3fend | all")
+    return v
+
+
+def _normalize_mode(mode: str) -> str:
+    v = (mode or "search").strip().lower()
+    if v not in ("search", "get"):
+        raise HTTPException(status_code=400, detail="mode must be one of: search | get")
+    return v
+
+
 @router.post("", response_model=QueryResponse)
 async def query_endpoint(payload: QueryRequest) -> QueryResponse:
-    """
-    Unified entrypoint for MITRE Expert Layer.
+    dataset = _normalize_dataset(payload.dataset)
+    mode = _normalize_mode(payload.mode)
 
-    - Uses rule-based router to decide which model(s) to call.
-    - Optionally chains Mapper -> Detect.
-    - Composes a single structured answer.
-    """
-    decision = route_query(payload.query)
+    where: Dict[str, Any] = {}
+    if payload.technique_id:
+        where["technique_id"] = payload.technique_id
+    if payload.section:
+        where["section"] = payload.section
+
+    # Non-MITRE datasets => retrieval-only
+    if dataset in ("d3fend", "all"):
+        if mode == "get":
+            if dataset == "all":
+                raise HTTPException(status_code=400, detail="mode=get is not supported with dataset=all")
+            if not where:
+                raise HTTPException(
+                    status_code=400,
+                    detail="mode=get requires at least one filter in 'where' (e.g., section or other metadata keys).",
+                )
+            res = get_chunks(dataset=dataset, where=where, limit=payload.topk)
+        else:
+            res = search_chunks(dataset=dataset, query=payload.query, k=payload.topk, where=where or None)
+
+        metas = res.get("metadatas", [[]])[0]
+        docs = res.get("documents", [[]])[0]
+        dists = res.get("distances", [[]])[0] if res.get("distances") else []
+        ids = res.get("ids", [[]])[0]
+
+        chunks_out: List[Dict[str, Any]] = []
+        for i, (cid, doc, meta) in enumerate(zip(ids, docs, metas)):
+            dist = float(dists[i]) if dists and i < len(dists) else None
+            meta = meta or {}
+            chunks_out.append(
+                {
+                    "chunk_id": cid,
+                    "dataset": meta.get("dataset", dataset),
+                    "section": meta.get("section", meta.get("chunk_type", meta.get("type", "unknown"))),
+                    "source": meta.get("source"),
+                    "distance": dist,
+                    "metadata": meta,
+                    "text": doc,
+                }
+            )
+
+        reasons = [f"retrieval_only: dataset={dataset}", f"mode={mode}"]
+        if where:
+            reasons.append(f"where={where}")
+
+        return QueryResponse(
+            question=payload.query,
+            summary=f"Returned {len(chunks_out)} chunks from dataset={dataset} using mode={mode}.",
+            tactics=[],
+            techniques=chunks_out,
+            sections={"chunks": chunks_out} if payload.include_raw_sections else None,
+            route_kind="retrieval",
+            route_reasons=reasons,
+        )
+
+    # MITRE dataset => original pipeline
+    # ✅ NEW: pass dataset/mode hints into the router (matches your src/router/router.py signature)
+    decision = route_query(payload.query, dataset=dataset, mode=mode)
 
     mapper_json: Optional[Dict[str, Any]] = None
     docqa_answer: Optional[str] = None
     detect_answer: Optional[str] = None
-
-    # Track which technique_id we ended up using (explicit, mapper, or resolver)
     top_technique_id: Optional[str] = payload.technique_id
 
-    # 1) Mapper if needed (mapper / mapper_detect)
     if decision.kind in ("mapper", "mapper_detect"):
-        mapper_result = map_text_to_techniques(
-            text=payload.query,
-            max_techniques=payload.max_techniques,
-        )
+        mapper_result = map_text_to_techniques(text=payload.query, max_techniques=payload.max_techniques)
         mapper_json = mapper_result_to_dict(mapper_result)
-
-        # Use top technique if none explicitly provided
         if not top_technique_id and mapper_json.get("techniques"):
             top_technique_id = mapper_json["techniques"][0]["id"]
 
-    # 2) Technique resolution for detect-only routes (no Mapper, no explicit ID)
     if decision.kind == "detect" and not top_technique_id:
         best = resolve_best_technique(payload.query, max_results=3)
         if best:
             top_technique_id = best.id
 
-    # 3) Detect if needed (detect / mapper_detect) and we have a technique_id
     if decision.kind in ("detect", "mapper_detect") and top_technique_id:
         detect_answer = answer_mitre_detect(
             technique_id=top_technique_id,
             platform=payload.platform,
             available_logs=payload.available_logs or [],
-            topk=8,
+            topk=payload.topk,
             temperature=0.2,
         )
 
-    # 4) DocQA:
-    #    - For docqa route: answer the original question.
-    #    - For mapper_detect / detect: optional enrichment (explain the technique).
     if decision.kind == "docqa":
-        docqa_answer = answer_mitre_docqa(
-            question=payload.query,
-            topk=8,
-            temperature=0.2,
-        )
+        docqa_answer = answer_mitre_docqa(question=payload.query, topk=payload.topk, temperature=0.2)
     elif decision.kind in ("mapper_detect", "detect"):
-        # Optional enrichment: explain the resolved/top technique in simple language
         if top_technique_id:
             docqa_answer = answer_mitre_docqa(
                 question=f"Explain {top_technique_id} in simple language.",
-                topk=8,
+                topk=payload.topk,
                 temperature=0.2,
             )
         else:
-            # Fallback: explain the query directly if we couldn't resolve a technique
-            docqa_answer = answer_mitre_docqa(
-                question=payload.query,
-                topk=8,
-                temperature=0.2,
-            )
+            docqa_answer = answer_mitre_docqa(question=payload.query, topk=payload.topk, temperature=0.2)
     elif decision.kind == "mapper" and not detect_answer:
-        # Optional enrichment for pure mapper: explain the top technique
         if top_technique_id:
             docqa_answer = answer_mitre_docqa(
                 question=f"Explain {top_technique_id} in simple language.",
-                topk=8,
+                topk=payload.topk,
                 temperature=0.2,
             )
 
-    # 5) Compose final answer from mapper_json + detect_answer + docqa_answer
     composed = compose_answer(
         question=payload.query,
         mapper_json=mapper_json,

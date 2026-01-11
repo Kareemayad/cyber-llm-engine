@@ -7,6 +7,7 @@ from mitre_expert.api.routers import (
     mitre_docqa,
     mitre_mapper,
     mitre_detect,
+    d3fend_docqa,  # ✅ NEW
     router as query_router,
 )
 
@@ -25,4 +26,5 @@ async def healthz():
 app.include_router(mitre_docqa.router)
 app.include_router(mitre_mapper.router)
 app.include_router(mitre_detect.router)
+app.include_router(d3fend_docqa.router)  # ✅ NEW
 app.include_router(query_router.router)

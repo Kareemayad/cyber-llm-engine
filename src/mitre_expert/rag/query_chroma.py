@@ -1,7 +1,20 @@
 # src/mitre_expert/rag/query_chroma.py
 
 """
-Query the MITRE Chroma index and inspect top-matching chunks.
+Query the Chroma index and inspect top-matching chunks.
+
+Multi-dataset support:
+  - MITRE collection:   mitre_chunks_v1
+  - D3FEND collection:  d3fend_chunks_v1
+
+Public API (generic layer):
+  - get_collection(dataset, with_embed=True/False)
+  - search_chunks(dataset, query, ...)
+  - get_chunks(dataset, where, ...)
+
+Datasets:
+  - "mitre" | "d3fend" | "all"
+    - "all" is supported for semantic search only (merges results by best distance).
 
 Adds:
 - Deterministic retrieval via collection.get(where=...) for enumeration tasks
@@ -13,6 +26,9 @@ FIXES (perf + correctness):
 - Use a NO-EMBED collection for deterministic .get() (collection.get() does not need embeddings)
 - Safer handling of limit=None for enumeration tasks (optional cap)
 - Semantic technique aggregation uses MAX(sim) per technique (avoids bias toward chunk-rich techniques)
+
+NOTE:
+- Technique resolution helpers remain MITRE-only.
 """
 
 from __future__ import annotations
@@ -33,17 +49,38 @@ from mitre_expert.models.technique_resolver import (
 )
 
 # ---------------------------------------------------------------------------
-# Paths & constants (must match index_chroma.py)
+# Paths & constants
 # ---------------------------------------------------------------------------
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DB_DIR = REPO_ROOT / "data" / "embeddings" / "mitre" / "chroma"
-COLLECTION_NAME = "mitre_chunks_v1"
 
 _DEFAULT_GET_HARD_CAP = int(os.getenv("MITRE_GET_HARD_CAP", "500"))
-
-# How many results to fetch before applying post-filters (dc/logsource)
 _PREFETCH_K = int(os.getenv("MITRE_PREFETCH_K", "50"))  # sensible default
+
+
+# ---------------------------------------------------------------------------
+# Dataset selection
+# ---------------------------------------------------------------------------
+
+def normalize_dataset(dataset: str | None) -> str:
+    ds = (dataset or "mitre").strip().lower()
+    if ds not in ("mitre", "d3fend", "all"):
+        raise ValueError(f"Unknown dataset={dataset!r}. Expected 'mitre'|'d3fend'|'all'.")
+    return ds
+
+
+def collection_name_for(dataset: str) -> str:
+    ds = normalize_dataset(dataset)
+    if ds == "mitre":
+        return "mitre_chunks_v1"
+    if ds == "d3fend":
+        return "d3fend_chunks_v1"
+    raise ValueError("collection_name_for() does not accept dataset='all'")
+
+
+def datasets_for_all() -> List[str]:
+    return ["mitre", "d3fend"]
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +200,7 @@ def normalize_where(where: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]
 
 
 # ---------------------------------------------------------------------------
-# Cached Chroma handles
+# Cached Chroma handles (generic selector)
 # ---------------------------------------------------------------------------
 
 @lru_cache(maxsize=1)
@@ -177,31 +214,36 @@ def _cached_embed_fn() -> embedding_functions.EmbeddingFunction:
     return get_embedding_function()
 
 
-@lru_cache(maxsize=1)
-def get_collection_with_embed():
-    client = _cached_client()
-    embed_fn = _cached_embed_fn()
-    return client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        embedding_function=embed_fn,
-    )
+@lru_cache(maxsize=16)
+def get_collection(dataset: str = "mitre", with_embed: bool = True):
+    """
+    Generic collection selector.
 
+    dataset:
+      - "mitre" | "d3fend"
+    with_embed:
+      - True  -> attaches embedding function (needed for semantic query)
+      - False -> no embedding function (faster for .get())
+    """
+    ds = normalize_dataset(dataset)
+    if ds == "all":
+        raise ValueError("get_collection(dataset='all') is not valid; use search_chunks(dataset='all', ...) instead.")
 
-@lru_cache(maxsize=1)
-def get_collection_no_embed():
     client = _cached_client()
-    return client.get_or_create_collection(name=COLLECTION_NAME)
+    name = collection_name_for(ds)
+
+    if with_embed:
+        embed_fn = _cached_embed_fn()
+        return client.get_or_create_collection(name=name, embedding_function=embed_fn)
+
+    return client.get_or_create_collection(name=name)
 
 
 # ---------------------------------------------------------------------------
-# Post-filter helpers (dc/logsource membership)
+# Post-filter helpers (MITRE telemetry filters; safe no-ops for D3FEND)
 # ---------------------------------------------------------------------------
 
 def _parse_csv_field(v: Any) -> List[str]:
-    """
-    Metadata fields are stored as CSV strings (because Chroma metadata doesn't support lists).
-    Accepts str or list-like just in case.
-    """
     if v is None:
         return []
     if isinstance(v, str):
@@ -223,9 +265,6 @@ def _filter_result(
     dc: Optional[List[str]] = None,
     logsource: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """
-    Filter a query() or get()-normalized result in-place and return the same shape.
-    """
     ids = result.get("ids", [[]])[0]
     docs = result.get("documents", [[]])[0]
     metas = result.get("metadatas", [[]])[0]
@@ -252,17 +291,16 @@ def _filter_result(
         if dists and i < len(dists):
             keep_dists.append(dists[i])
 
-    out = {
+    return {
         "ids": [keep_ids],
         "documents": [keep_docs],
         "metadatas": [keep_metas],
         "distances": [keep_dists] if dists else [[]],
     }
-    return out
 
 
 # ---------------------------------------------------------------------------
-# Core helpers
+# Generic core functions
 # ---------------------------------------------------------------------------
 
 def _apply_get_limit(limit: Optional[int]) -> Optional[int]:
@@ -274,21 +312,43 @@ def _apply_get_limit(limit: Optional[int]) -> Optional[int]:
     return cap
 
 
-def get_mitre_chunks_by_filter(
+def get_chunks(
+    dataset: str,
     where: Dict[str, Any],
     limit: Optional[int] = None,
+    include: Optional[List[str]] = None,
     dc: Optional[List[str]] = None,
     logsource: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    collection = get_collection_no_embed()
+    """
+    Deterministic fetch via collection.get(where=...).
+
+    dataset:
+      - "mitre" | "d3fend"
+      - (NOT "all")
+
+    include defaults to ["documents", "metadatas"].
+
+    dc/logsource:
+      - Applies post-filtering if those fields exist (MITRE).
+      - Safe no-op on D3FEND.
+    """
+    ds = normalize_dataset(dataset)
+    if ds == "all":
+        raise ValueError("get_chunks(dataset='all') is not supported (ambiguous).")
+
+    collection = get_collection(dataset=ds, with_embed=False)
     where_norm = normalize_where(where)
     lim = _apply_get_limit(limit)
-    print(f"[query] Fetching by filter (where={where}, normalized={where_norm}, limit={limit} -> {lim})")
+
+    inc = include or ["documents", "metadatas"]
+
+    print(f"[query] GET dataset={ds} where={where_norm} limit={limit}->{lim} include={inc}")
 
     out = collection.get(
         where=where_norm,
         limit=lim,
-        include=["documents", "metadatas"],
+        include=inc,
     )
 
     normalized = {
@@ -297,40 +357,53 @@ def get_mitre_chunks_by_filter(
         "metadatas": [out.get("metadatas", [])],
         "distances": [[]],
     }
-    filtered = _filter_result(normalized, dc=dc, logsource=logsource)
-    return filtered
+    return _filter_result(normalized, dc=dc, logsource=logsource)
 
 
-def search_mitre_chunks(
+def search_chunks(
+    dataset: str,
     query: str,
     k: int = 5,
     where: Optional[Dict[str, Any]] = None,
+    include: Optional[List[str]] = None,
     dc: Optional[List[str]] = None,
     logsource: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
-    Semantic query. We prefetch more than k, then apply post-filters, then trim to k.
-    """
-    collection = get_collection_with_embed()
-    where_norm = normalize_where(where)
+    Semantic query.
 
-    # Prefetch to allow filters to work without starving results
+    dataset:
+      - "mitre" | "d3fend" | "all"
+        - "all" merges results across both collections by best distance.
+
+    where:
+      - Optional filter dict; for "all" you should only use filters that exist in both datasets.
+
+    dc/logsource:
+      - MITRE-only post-filters; safe no-op for D3FEND.
+      - For dataset="all": we apply dc/logsource only to MITRE results.
+    """
+    ds = normalize_dataset(dataset)
+    where_norm = normalize_where(where)
+    inc = include or ["documents", "metadatas", "distances"]
+
+    if ds == "all":
+        return _search_all(query=query, k=k, where=where_norm, include=inc)
+
+    collection = get_collection(dataset=ds, with_embed=True)
     prefetch = max(int(k), _PREFETCH_K)
-    if where:
-        print(f"[query] Searching for: {query!r} (prefetch={prefetch}, want_k={k}, where={where_norm}, dc={dc}, logsource={logsource})")
-    else:
-        print(f"[query] Searching for: {query!r} (prefetch={prefetch}, want_k={k}, dc={dc}, logsource={logsource})")
+
+    print(f"[query] SEARCH dataset={ds} query={query!r} prefetch={prefetch} k={k} where={where_norm}")
 
     raw = collection.query(
         query_texts=[query],
         n_results=prefetch,
-        include=["documents", "metadatas", "distances"],
+        include=inc,
         where=where_norm,
     )
 
     filtered = _filter_result(raw, dc=dc, logsource=logsource)
 
-    # Trim to k after filters
     ids = filtered.get("ids", [[]])[0][:k]
     docs = filtered.get("documents", [[]])[0][:k]
     metas = filtered.get("metadatas", [[]])[0][:k]
@@ -343,6 +416,101 @@ def search_mitre_chunks(
         "distances": [dists] if dists else [[]],
     }
 
+
+def _search_all(
+    query: str,
+    k: int = 5,
+    where: Optional[Dict[str, Any]] = None,
+    include: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Semantic query across BOTH datasets and merge top-k by best distance.
+
+    Notes:
+    - We do not apply MITRE-only post-filters here at merge time.
+    - We add meta['dataset'] so callers can attribute results.
+    """
+    inc = include or ["documents", "metadatas", "distances"]
+
+    merged: List[Tuple[str, str, Dict[str, Any], float]] = []
+
+    for ds in datasets_for_all():
+        res = search_chunks(dataset=ds, query=query, k=max(k, _PREFETCH_K), where=where, include=inc)
+        ids = res.get("ids", [[]])[0]
+        docs = res.get("documents", [[]])[0]
+        metas = res.get("metadatas", [[]])[0]
+        dists = res.get("distances", [[]])[0] if res.get("distances") else []
+
+        for i, (cid, doc, meta) in enumerate(zip(ids, docs, metas)):
+            dist = float(dists[i]) if dists and i < len(dists) else 1.0
+            meta = meta or {}
+            meta["dataset"] = ds
+            merged.append((cid, doc, meta, dist))
+
+    merged.sort(key=lambda x: x[3])  # smaller distance = better
+    merged = merged[:k]
+
+    return {
+        "ids": [[x[0] for x in merged]],
+        "documents": [[x[1] for x in merged]],
+        "metadatas": [[x[2] for x in merged]],
+        "distances": [[x[3] for x in merged]],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatible wrappers (keep existing imports working)
+# ---------------------------------------------------------------------------
+
+def get_mitre_chunks_by_filter(
+    where: Dict[str, Any],
+    limit: Optional[int] = None,
+    dc: Optional[List[str]] = None,
+    logsource: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    return get_chunks(dataset="mitre", where=where, limit=limit, dc=dc, logsource=logsource)
+
+
+def search_mitre_chunks(
+    query: str,
+    k: int = 5,
+    where: Optional[Dict[str, Any]] = None,
+    dc: Optional[List[str]] = None,
+    logsource: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    return search_chunks(dataset="mitre", query=query, k=k, where=where, dc=dc, logsource=logsource)
+
+
+# ✅ NEW: D3FEND wrappers (fixes ImportError in d3fend_docqa.py)
+
+def get_d3fend_chunks_by_filter(
+    where: Dict[str, Any],
+    limit: Optional[int] = None,
+    include: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Deterministic fetch for D3FEND via collection.get(where=...).
+    Mirrors the MITRE wrapper style for compatibility.
+    """
+    return get_chunks(dataset="d3fend", where=where, limit=limit, include=include)
+
+
+def search_d3fend_chunks(
+    query: str,
+    k: int = 5,
+    where: Optional[Dict[str, Any]] = None,
+    include: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Semantic query for D3FEND.
+    This exists primarily to keep LLM modules/router imports stable.
+    """
+    return search_chunks(dataset="d3fend", query=query, k=k, where=where, include=include)
+
+
+# ---------------------------------------------------------------------------
+# Pretty printing
+# ---------------------------------------------------------------------------
 
 def pretty_print_results(result: Dict[str, Any]) -> None:
     ids = result.get("ids", [[]])[0]
@@ -360,10 +528,13 @@ def pretty_print_results(result: Dict[str, Any]) -> None:
             dist = dists[rank - 1]
 
         meta = meta or {}
+        ds = meta.get("dataset")
+
         tech_id = meta.get("technique_id", "unknown")
         tech_name = meta.get("technique_name", "")
         source = meta.get("source", "unknown")
         section = meta.get("section", meta.get("chunk_type", meta.get("type", "unknown")))
+
         mit_id = meta.get("mitigation_id")
         mit_name = meta.get("mitigation_name")
 
@@ -372,6 +543,8 @@ def pretty_print_results(result: Dict[str, Any]) -> None:
 
         print("=" * 80)
         print(f"[{rank}] id={cid}")
+        if ds:
+            print(f"    dataset:       {ds}")
         if dist is not None:
             print(f"    distance:      {float(dist):.4f}")
         print(f"    technique:     {tech_id} {('- ' + tech_name) if tech_name else ''}")
@@ -390,7 +563,7 @@ def pretty_print_results(result: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Technique detection helpers
+# Technique detection helpers (MITRE-only)
 # ---------------------------------------------------------------------------
 
 def detect_techniques_from_query(
@@ -398,7 +571,11 @@ def detect_techniques_from_query(
     detect_k: int = 30,
     max_candidates: int = 3,
 ) -> List[Tuple[str, float]]:
-    collection = get_collection_with_embed()
+    """
+    MITRE-only semantic technique detection.
+    Uses the MITRE collection metadata technique_id.
+    """
+    collection = get_collection(dataset="mitre", with_embed=True)
 
     raw = collection.query(
         query_texts=[query],
@@ -431,6 +608,9 @@ def resolve_best_technique(
     query: str,
     max_results: int = 3,
 ) -> Optional[TechniqueCandidate]:
+    """
+    MITRE-only technique resolver (id regex/name match + semantic backstop).
+    """
     resolved = resolve_techniques_from_text(query, max_results=max_results)
     if resolved:
         return resolved[0]
@@ -449,6 +629,11 @@ def auto_search_mitre_chunks(
     dc: Optional[List[str]] = None,
     logsource: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
+    """
+    MITRE-only auto search:
+    - resolve technique id, then filter
+    - else global MITRE search
+    """
     best = resolve_best_technique(query, max_results=3)
     if best:
         print(
@@ -457,59 +642,34 @@ def auto_search_mitre_chunks(
         )
         return search_mitre_chunks(query=query, k=k, where={"technique_id": best.id}, dc=dc, logsource=logsource)
 
-    print("[query] Could not detect technique_id, falling back to global search.")
+    print("[query] Could not detect technique_id, falling back to global MITRE search.")
     return search_mitre_chunks(query=query, k=k, where=None, dc=dc, logsource=logsource)
 
 
 # ---------------------------------------------------------------------------
-# CLI entrypoint
+# CLI entrypoint (dataset aware)
 # ---------------------------------------------------------------------------
 
 def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Query the MITRE Chroma RAG index (mitre_chunks_v1).",
+        description="Query the Chroma RAG index (MITRE/D3FEND).",
     )
+    parser.add_argument("query", nargs="+", help="Natural language query text.")
+    parser.add_argument("-k", "--topk", type=int, default=5, help="Number of results to return.")
     parser.add_argument(
-        "query",
-        nargs="+",
-        help="Natural language query text.",
-    )
-    parser.add_argument(
-        "-k",
-        "--topk",
-        type=int,
-        default=5,
-        help="Number of results to return (default: 5).",
-    )
-    parser.add_argument(
-        "--tech",
-        "--technique",
-        dest="technique_id",
-        help="Optional MITRE technique ID to filter on (e.g., T1548, T1055.001).",
-    )
-    parser.add_argument(
-        "--section",
-        dest="section",
-        help="Optional section filter (e.g., mitigation, description, detection_strategy).",
+        "--dataset",
+        choices=["mitre", "d3fend", "all"],
+        default=os.getenv("RAG_TARGET", "mitre"),
+        help="Dataset to query (default from env RAG_TARGET).",
     )
     parser.add_argument(
         "--mode",
         choices=["search", "get"],
         default="search",
-        help="search = semantic query (default), get = deterministic fetch by filter.",
+        help="search = semantic query, get = deterministic fetch by filter.",
     )
-    parser.add_argument(
-        "--dc",
-        dest="data_components",
-        action="append",
-        help="Filter results to chunks that include this data component ID (repeatable), e.g. --dc DC0032",
-    )
-    parser.add_argument(
-        "--logsource",
-        dest="log_sources",
-        action="append",
-        help="Filter results to chunks that include this log source name (repeatable), e.g. --logsource azure:signinlogs",
-    )
+    parser.add_argument("--tech", dest="technique_id", help="MITRE technique_id filter (MITRE only).")
+    parser.add_argument("--section", dest="section", help="Optional section filter.")
     return parser.parse_args(argv)
 
 
@@ -523,19 +683,18 @@ def main(argv: List[str] | None = None) -> None:
     if args.section:
         where["section"] = args.section
 
-    dc = [x.strip() for x in (args.data_components or []) if x and x.strip()]
-    logsource = [x.strip() for x in (args.log_sources or []) if x and x.strip()]
+    ds = normalize_dataset(args.dataset)
 
     if args.mode == "get":
+        if ds == "all":
+            print("[query] ERROR: --mode get is not supported with dataset=all (ambiguous collection).")
+            sys.exit(2)
         if not where:
             print("[query] ERROR: --mode get requires at least one filter (e.g., --tech or --section).")
             sys.exit(2)
-        result = get_mitre_chunks_by_filter(where=where, limit=args.topk, dc=dc, logsource=logsource)
+        result = get_chunks(dataset=ds, where=where, limit=args.topk)
     else:
-        if where:
-            result = search_mitre_chunks(query=query_text, k=args.topk, where=where, dc=dc, logsource=logsource)
-        else:
-            result = auto_search_mitre_chunks(query=query_text, k=args.topk, dc=dc, logsource=logsource)
+        result = search_chunks(dataset=ds, query=query_text, k=args.topk, where=where or None)
 
     pretty_print_results(result)
 
