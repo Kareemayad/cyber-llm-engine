@@ -1,1133 +1,521 @@
-# MITRE Expert Layer v1 — Architecture & Runtime Flow
+Cyber LLM Engine – MITRE Expert Layer
+Architecture Document (V1)
+1. Executive Summary
 
-This repository implements a **local MITRE ATT&CK expert** with:
+The Cyber LLM Engine – MITRE Expert Layer is a local, self-hosted AI system designed to assist Security Operations Center (SOC) teams.
 
-- A **MITRE knowledge pack** (chunked JSONL)
-- A **ChromaDB RAG index** over those chunks
-- Three MITRE-aware “specialists” built on a single local LLM:
-  - **MITRE-DocQA**: encyclopedia Q&A about ATT&CK
-  - **MITRE-Mapper**: map alerts/log text/CTI → techniques + tactics (+ telemetry)
-  - **MITRE-Detect**: generate detection ideas for a technique, given available logs/platform
-- A **router** that decides which specialist(s) to run
-- A **FastAPI** server exposing `/query` (smart entrypoint) + specialist endpoints
+It acts as an intelligent cybersecurity assistant that can:
 
-> Mental model: **one local LLM + one Chroma index + rule-based routing + structured composition**.
+Explain MITRE ATT&CK techniques in clear language
 
----
+Map logs, alerts, and CTI text to likely ATT&CK techniques
 
-## 1) High-Level Flow (End-to-End)
+Provide detection guidance based on available telemetry
 
-### Offline build
+Answer defensive (D3FEND) questions using structured countermeasure data
 
-1. Raw MITRE data (STIX/JSON/JSONL) → normalized **TechniqueRecord** objects.
-2. Techniques → **chunked JSONL knowledge pack** (`mitre_chunks_v1.jsonl`).
-3. Knowledge pack → **Chroma embeddings index** (`mitre_chunks_v1` collection).
+Do all of the above without hallucinating, by strictly grounding answers in trusted datasets
 
-### Runtime
+The system combines:
 
-1. Client calls `/query` with natural language text (alert/log/CTI/question).
-2. Router decides route: `docqa | mapper | detect | mapper_detect`.
-3. Selected module(s) run:
-   - deterministic resolution (regex / metadata lookups)
-   - semantic search over Chroma
-   - LLM answer generation with strict MITRE-focused prompts
-4. AnswerComposer merges into a single response object:
+Retrieval-Augmented Generation (RAG)
 
-```json
-{
-  "question": "...",
-  "summary": "...",
-  "tactics": ["TA0005", "TA0004"],
-  "techniques": [
-    {
-      "id": "T1548",
-      "name": "Abuse Elevation Control Mechanism",
-      "confidence": 0.97,
-      "tactics": ["TA0004", "TA0005"],
-      "data_components": ["DC0032", "DC0088", "..."],
-      "log_sources": ["WinEventLog:Security", "auditd:SYSCALL", "..."]
-    }
-  ],
-  "sections": {
-    "mapping": { ... },
-    "docqa": { "answer": "..." },
-    "detection": { "answer": "..." }
-  },
-  "route_kind": "mapper_detect",
-  "route_reasons": ["contains log-like terms", "mentions detection"]
-}
-2) Repository Layout (What Matters)
-text
-Copy code
-data/
-  raw/mitre/                 # Raw MITRE exports (STIX/JSON/JSONL)
-  processed/mitre/
-    mitre_knowledge_pack_v1.jsonl  # Normalized techniques
-    mitre_chunks_v1.jsonl          # Chunked RAG source (central runtime input)
-  embeddings/mitre/chroma/  # Persistent ChromaDB index
+Deterministic rule-based logic
 
-src/
-  mitre_expert/
-    api/                    # FastAPI endpoints
-    knowledge_pack/         # Build techniques + chunks
-    llm/                    # DocQA, Mapper, Detect, AnswerComposer, local_llm
-    models/                 # TechniqueRecord, ChunkRecord, technique_resolver, enums
-    rag/                    # Chroma indexing/query helpers
-    config.py               # Paths/env config
+Local Large Language Models (LLMs)
 
-  router/
-    router.py               # Rule-based router for /query
+MITRE ATT&CK and D3FEND datasets
 
-scripts/
-  run_build_mitre_knowledge_pack.sh
-  run_index_mitre_chroma.sh
-  run_mitre_docqa_api.sh
-Single source of truth: data/processed/mitre/mitre_chunks_v1.jsonl powers:
+Everything runs locally, without sending data to external APIs.
 
-Chroma RAG index
+2. Core Design Goals
 
-Technique resolver vocabulary
+This project was designed with the following principles:
 
-Telemetry-aware scoring (Mapper + Detect + DocQA context)
+2.1 Zero Hallucination Tolerance
 
-3) Data Pipeline — How MITRE Knowledge Is Prepared
-3.1 Raw Inputs
-Located in data/raw/mitre/:
+The system must not invent:
 
-Official MITRE ATT&CK STIX/JSON (e.g. enterprise-attack.json)
+Technique IDs
 
-Extended technique dumps (e.g. techniques_full.jsonl)
+Mitigation IDs
 
-Enriched telemetry versions (e.g. techniques_full_enriched_v2.jsonl)
+Detection rules
 
-Raw files are never queried at runtime. They are transformed into a normalized knowledge pack + chunked JSONL.
+Products, tools, or event IDs
 
-3.2 Normalized Techniques
-File: src/mitre_expert/knowledge_pack/build_knowledge_pack.py
-Core types: TechniqueRecord, ChunkRecord (src/mitre_expert/models/technique.py).
+If information is missing, the system explicitly says:
 
-Flow:
+“The provided context does not specify this detail.”
 
-_pick_input_path() prefers enriched techniques file:
+2.2 Dataset-Grounded Intelligence
 
-data/processed/mitre/techniques_full_enriched_v2.jsonl
+All answers are based only on:
 
-falls back to data/raw/mitre/techniques_full.jsonl
+MITRE ATT&CK data
 
-_load_raw_techniques() supports:
+MITRE D3FEND data
 
-{"techniques": [ {...}, {...} ]}
+Explicitly retrieved context chunks
 
-[ {...}, {...} ]
+The LLM is not allowed to use its training knowledge beyond the supplied context.
 
-JSONL one technique per line
+2.3 SOC-First Usability
 
-TechniqueRecord.from_raw(rec) normalizes each record:
+The system is designed for:
 
-technique_id, technique_name, domain, url
+SOC Analysts (L1–L3)
 
-tactic_ids, tactic_names (flattened from nested tactics)
+Detection Engineers
 
-platforms (normalized strings)
+Threat Hunters
 
-telemetry enrichment:
+Outputs are:
 
-data_component_ids: List[str]
+Structured
 
-log_source_names: List[str]
+Explainable
 
-nested content for chunking:
+Practical
 
-procedure_examples
+Log-centric
 
-associated_mitigations
+2.4 Modular & Extensible
 
-associated_detection_strategies
+Each capability (DocQA, Mapper, Detect, D3FEND) is:
 
-Output (normalized techniques) →
-data/processed/mitre/mitre_knowledge_pack_v1.jsonl
+Independent
 
-3.3 Chunked Knowledge Pack (RAG Source)
-Still in build_knowledge_pack.py, TechniqueRecord.iter_chunks() explodes each technique into multiple ChunkRecords:
+Replaceable
 
-One description chunk (technique-level summary)
+Testable
 
-One procedure_example chunk per procedure
+Future datasets and models can be added without rewriting the system.
 
-One mitigation chunk per associated mitigation
+3. High-Level System Overview
 
-One detection_strategy chunk per analytic
+At a high level, the system works as follows:
 
-Each ChunkRecord includes:
+User Input
+   ↓
+FastAPI Endpoint
+   ↓
+Rule-Based Router
+   ↓
+Specialist Module (DocQA / Mapper / Detect / D3FEND)
+   ↓
+RAG Retrieval (Chroma)
+   ↓
+Local LLM (strict prompts)
+   ↓
+Structured Answer
 
-chunk_id (e.g., T1548_desc, T1548_mit_M1052, T1548_det_AN0975)
+4. Datasets Used
+4.1 MITRE ATT&CK
 
-technique_id, technique_name
+MITRE ATT&CK is a globally recognized knowledge base describing:
 
-section:
+Adversary tactics
 
-description
+Techniques and sub-techniques
 
-procedure_example
+Mitigations
 
-mitigation
+Detection guidance
 
-detection_strategy
+Telemetry relationships
 
-text (body)
+This project uses ATT&CK as the primary offensive and detection knowledge source.
 
-Tactics / platforms:
+4.2 MITRE D3FEND
 
-tactic_ids, tactic_names
+MITRE D3FEND is a defensive ontology describing:
+
+Defensive techniques
+
+Security controls
+
+Artifacts
+
+Relationships to ATT&CK techniques
+
+D3FEND is used to answer:
+
+“How do we defend against X?”
+
+“What countermeasures map to this attack?”
+
+5. Offline Data Processing (Knowledge Pack Build)
+
+Before the system can answer questions, raw MITRE data must be transformed.
+
+5.1 MITRE Knowledge Pack Builder
+
+File:
+src/mitre_expert/knowledge_pack/build_knowledge_pack.py
+
+Purpose
+
+Convert raw MITRE ATT&CK data into:
+
+A normalized internal representation
+
+Small, searchable RAG chunks
+
+Inputs
+
+Raw or enriched MITRE technique JSON / JSONL files
+
+Outputs
+
+mitre_knowledge_pack_v1.jsonl
+
+mitre_chunks_v1.jsonl
+
+5.2 Technique Normalization
+
+Each ATT&CK technique becomes a TechniqueRecord containing:
+
+Technique ID (e.g. T1059.001)
+
+Technique name
+
+Tactics (IDs and names)
+
+Platforms
+
+Telemetry enrichment:
+
+Data Component IDs
+
+Log Source Names
+
+Rich content:
+
+Description
+
+Procedure examples
+
+Mitigations
+
+Detection strategies
+
+This ensures consistent structure regardless of input format.
+
+5.3 Chunk Generation
+
+Each technique is split into semantic chunks:
+
+Chunk Type	Purpose
+description	Explain what the technique is
+procedure_example	How adversaries use it
+mitigation	How to mitigate it
+detection_strategy	How to detect it
+
+Each chunk includes metadata such as:
+
+technique_id
+
+section
 
 platforms
 
-Telemetry (copied from technique):
+telemetry hints
 
-data_component_ids
+These chunks are later embedded and indexed.
 
-log_source_names
+5.4 D3FEND Normalization
 
-Optional analytics/mitigation metadata:
+File:
+src/mitre_expert/knowledge_pack/build_d3fend.py
 
-procedure_source_*
+Purpose
 
-mitigation_id, mitigation_name
+Transform D3FEND’s JSON-LD ontology and CSV mappings into structured defensive records.
 
-analytic_id, analytic_name
+Key Steps
 
-Chunks are written as JSONL:
+Expand JSON-LD identifiers using namespaces
 
-data/processed/mitre/mitre_chunks_v1.jsonl ← central runtime file
+Canonicalize nodes into readable JSON
 
-4) RAG Index — ChromaDB + Embeddings
-4.1 Indexing
-File: src/mitre_expert/rag/index_chroma.py
+Attach ATT&CK mappings from CSV
 
-Input: data/processed/mitre/mitre_chunks_v1.jsonl
+Preserve full raw ontology data for traceability
 
-Output: Chroma persistent DB under data/embeddings/mitre/chroma/
+Outputs
 
-collection: "mitre_chunks_v1"
+Consolidated JSON (debug/reference)
 
-Steps:
+JSONL suitable for RAG chunking
 
-_load_chunks(CHUNKS_PATH) streams JSONL records.
+6. Vector Database (Chroma)
+6.1 Why Chroma?
 
-For each record:
+Chroma is used as a vector database to:
 
-Ensure a unique ID:
+Store embeddings of chunks
 
-rec["id"] or rec["chunk_id"] or "chunk_{idx}"
+Enable semantic search
 
-duplicate IDs get ::dup::N suffix
+Support metadata-based filtering
 
-Require non-empty text.
+Each dataset has its own collection:
 
-_build_metadata_from_record(rec) flattens metadata:
+mitre_chunks_v1
 
-Core keys: technique_id, technique_name, section, chunk_type, type
+d3fend_chunks_v1
 
-Tactics / platforms
+6.2 Retrieval Modes
 
-Telemetry: data_component_ids, log_source_names
+The system supports two retrieval modes:
 
-Mitigation & analytic IDs/names
+Semantic Search
 
-_sanitize_metadata(meta) makes values Chroma-safe:
+Used when:
 
-Drop None
+User asks a natural language question
 
-list/tuple/set → comma-separated string, dropping None
+Exact technique ID is unknown
 
-Convert other types to str
+Deterministic Get
 
-Embedding backend (MITRE_EMBED_BACKEND env):
+Used when:
 
-"hf": sentence-transformers/all-MiniLM-L6-v2 by default
+Technique ID and section are known
 
-"ollama": local Ollama embeddings (e.g. nomic-embed-text)
+Exact chunks must be retrieved (e.g. all mitigations)
 
-Insert embeddings in batches (BATCH_SIZE=64).
+7. Runtime Architecture (FastAPI)
+7.1 API Entry Point
 
-Result: each chunk has:
+File:
+src/mitre_expert/api/main.py
 
-document = chunk text
+The FastAPI app exposes:
 
-metadata = flattened fields
+Health check
 
-embedding = vector for semantic search
+Specialist endpoints
 
-4.2 Query Helpers
-File: src/mitre_expert/rag/query_chroma.py
+Unified /query endpoint
 
-Key design points:
+7.2 Unified Query Router
 
-Cached Chroma client, embedding function, and collections
+File:
+src/mitre_expert/api/routers/router.py
 
-Distinguishes:
+This endpoint accepts:
 
-With embed collection (for .query())
+A question or log
 
-No-embed collection (for .get() deterministic filter fetches)
+Dataset selection
 
-Normalizes Chroma filters for newer versions (single top-level operator)
+Retrieval mode
 
-Helpers:
+Optional filters
 
-normalize_where(where: dict | None) -> dict | None
+It determines:
 
-Converts {"a":1,"b":2} → {"$and":[{"a":1},{"b":2}]}
+Which specialist to invoke
 
-Leaves already operator-based filters ({"$and":[...]}) as-is.
+Whether to use LLMs or retrieval-only
 
-get_mitre_chunks_by_filter(where, limit=None, dc=None, logsource=None)
+7.3 Rule-Based Routing Logic
 
-Uses no-embed collection + .get() with metadata filter.
+File:
+src/router/router.py
 
-Applies post-filters:
+The router analyzes the query using:
 
-dc → membership in data_component_ids
+Technique ID detection
 
-logsource → membership in log_source_names
+Log / alert keywords
 
-Returns normalized structure: ids/documents/metadatas/distances.
+Detection keywords
 
-search_mitre_chunks(query, k=5, where=None, dc=None, logsource=None)
+Possible routes:
 
-Uses embedded collection + .query().
+docqa
 
-Prefetches more than k (configurable via MITRE_PREFETCH_K) to allow post-filters.
+mapper
 
-Applies dc/logsource post-filter, then trims to k.
+detect
 
-detect_techniques_from_query(query, detect_k=30, max_candidates=3)
+mapper_detect
 
-Global semantic search for detection of likely techniques.
+This ensures the right intelligence path is used.
 
-Aggregates similarity per technique_id (max similarity) to avoid bias toward chunk-rich techniques.
+8. Specialist Modules
+8.1 MITRE DocQA
 
-resolve_best_technique(query, max_results=3)
+Purpose:
+Explain techniques, mitigations, tactics, platforms.
 
-Calls deterministic resolver (resolve_techniques_from_text) first.
+Key Features:
 
-If nothing, falls back to semantic detection above.
+RAG context building
 
-Returns TechniqueCandidate or None.
+Special mitigation enumeration mode
 
-auto_search_mitre_chunks(query, k=5, dc=None, logsource=None)
+Metadata extraction (tactics/platforms)
 
-For DocQA:
+Strict non-hallucination prompt
 
-If technique detected → semantic search constrained to that technique_id.
+8.2 MITRE Mapper
 
-Else → global semantic search.
+Purpose:
+Map logs, alerts, or CTI text to ATT&CK techniques.
 
-5) Technique Resolver — Deterministic Technique Detection
-File: src/mitre_expert/models/technique_resolver.py
+Signals Used:
 
-Purpose: identify technique IDs in text without using the LLM.
+Deterministic resolver (IDs, names, fuzzy match)
 
-At startup (or first use):
+Semantic similarity (Chroma)
 
-Scan mitre_chunks_v1.jsonl.
+Domain-specific priors
 
-Build vocabulary:
+Telemetry alignment (logs + data components)
 
-technique_id → TechniqueInfo(id, name, normalized_name)
+Outputs ranked techniques with confidence scores.
 
-name index for normalized technique names
+8.3 MITRE Detect
 
-Resolution (resolve_techniques_from_text(text, max_results=5)):
+Purpose:
+Provide detection guidance for a technique.
 
-ID regex:
+Process:
 
-Find T#### and T####.### patterns.
+Prefer detection_strategy chunks
 
-Score = 1.0, source = "id_regex".
+Fallback to semantic retrieval if missing
 
-Exact name match:
+Bias retrieval using available logs
 
-If normalized_name appears as substring in normalized text.
+Generate structured detection advice
 
-Score ≈ 0.95, source = "name_exact".
+8.4 D3FEND DocQA
 
-Fuzzy name match (optional, if rapidfuzz installed):
+Purpose:
+Answer defensive questions using D3FEND data.
 
-partial_ratio(name, text) ≥ threshold.
+Characteristics:
 
-Score scaled into [0,1], source = "name_fuzzy".
+Pure RAG
 
-Deduplicate by technique_id, keep highest score/source.
+No inference beyond context
 
-Return TechniqueCandidate list sorted by score, truncated to max_results.
+Defensive ontology focus
 
-This resolver feeds:
+ATT&CK linkage preserved
 
-resolve_best_technique() in RAG.
+9. Local LLM Layer
 
-map_text_to_techniques() in MITRE-Mapper.
+File:
+src/mitre_expert/llm/local_llm.py
 
-Router /query heuristics (via resolver when needed).
+9.1 Why Local LLM?
 
-6) Local LLM Wrapper
-File: src/mitre_expert/llm/local_llm.py
+Data privacy
 
-Model:
+Deterministic behavior
 
-Default: local HF model at
-src/mitre_expert/models/llama3.1-8b-instruct
+Cost control
 
-Path override: MITRE_DOCQA_MODEL_PATH
+Full control over prompts and context
 
-Device / dtype:
+9.2 Model Handling
 
-MPS (Apple Silicon):
+Supports Apple MPS, CUDA, CPU
 
-DEVICE=mps, DTYPE=float32 (stability for long prompts)
+Uses HuggingFace Transformers
 
-CUDA:
+Chat template aware
 
-DTYPE=bfloat16 if supported, else float16
+Context window enforcement
 
-CPU:
+Deterministic decoding for knowledge tasks
 
-DTYPE=float32
+10. Prompt Engineering Philosophy
 
-Config env:
+Each specialist has its own system prompt enforcing:
 
-MITRE_LLM_MAX_CONTEXT (optional global context cap)
+Context-only answers
 
-MITRE_LLM_MAX_NEW_TOKENS (optional global max generation length)
+Explicit refusal to guess
 
-generate_answer(system_prompt, user_content, ...):
+SOC-friendly tone
 
-Load tokenizer/model once (lazy, cached).
+Structured output
 
-Build chat messages: [{"role":"system"...}, {"role":"user"...}].
+Bullet lists where appropriate
 
-Use tokenizer.apply_chat_template(...) when available.
+This is a core safety mechanism, not an afterthought.
 
-Tokenize without truncation; manually enforce context window:
+11. What Is Missing (V1 Gaps)
+11.1 Chroma Indexing Scripts
 
-Use model’s max_position_embeddings (or env override).
+The project assumes, but does not yet include:
 
-Left-truncate prompt if needed (keep latest tokens).
+A full indexing pipeline for MITRE and D3FEND
 
-Generation:
+Metadata validation before insertion
 
-If temperature is None → greedy (do_sample=False).
+11.2 D3FEND Chunk Generator
 
-If temperature is not None → sampling with top_p + repetition_penalty.
+D3FEND normalization exists, but chunk generation into:
 
-Decode only newly generated tokens.
+definitions
 
-DocQA/Detect treat temperature=None as true deterministic mode.
-API maps temperature=0.0 from JSON payloads → None.
+KB articles
 
-7) Specialist Modules
-7.1 MITRE-DocQA (Encyclopedic Answers)
-File: src/mitre_expert/llm/mitre_docqa.py
+relations
 
-Goal: answer MITRE ATT&CK questions (techniques, mitigations, tactics, etc.) using only MITRE chunks.
+references
+is not yet implemented.
 
-Core pieces:
+11.3 Unified “dataset=all” Intelligence
 
-DOCQA_SYSTEM_PROMPT (in llm/prompts.py):
+Currently:
 
-Enforces:
+dataset=all is retrieval-only
 
-Only use MITRE CONTEXT.
+Missing:
 
-No invented tools/mitigations/IDs.
+Combined MITRE + D3FEND reasoning and composition
 
-Explicitly say “not specified” if context lacks details.
+11.4 Evaluation & Testing Framework
 
-Context building
-build_mitre_context(question: str, topk: int = 8) -> str:
+No regression or accuracy tests are defined yet.
 
-Detect whether question is a mitigation enumeration:
+12. Intended Future Direction
 
-Looks for phrases like:
+Planned enhancements include:
 
-“which mitigations…”
+SOC L1–L3 role-aware responses
 
-“list mitigations…”
+ATT&CK + D3FEND hybrid reasoning
 
-“mitigations for T####…”
+Detection rule generation (Sigma templates)
 
-Uses technique ID regex.
+Multi-dataset orchestration
 
-If enumeration mode:
+Confidence explanations for Mapper outputs
 
-best = resolve_best_technique(question)
+13. Final Summary
 
-technique_id = best.id (if present)
+This project is not just an LLM wrapper.
 
-Fetch 1 description chunk via:
+It is a:
 
-python
-Copy code
-get_mitre_chunks_by_filter(
-    where={"technique_id": technique_id, "section": "description"},
-    limit=1,
-)
-Fetch ALL mitigation chunks:
+Dataset-grounded
 
-python
-Copy code
-get_mitre_chunks_by_filter(
-    where={"technique_id": technique_id, "section": "mitigation"},
-    limit=None,
-)
-Sort mitigations by M#### (numeric).
+Deterministic-first
 
-Emit structured blocks:
+SOC-grade
 
-text
-Copy code
-[T1548 - Abuse Elevation Control Mechanism | description]
-<desc text>
+Hallucination-resistant
 
-T1548 | mitigation M1018 - User Account Management
-<M1018 text>
+Extensible cybersecurity intelligence engine
 
-...
-Else (default semantic mode):
-
-result = auto_search_mitre_chunks(question, k=topk)
-
-Emit per-chunk headers based on section (mitigation, description, detection_strategy, etc.).
-
-Include mitigation headers like:
-
-text
-Copy code
-T1548 | mitigation M1052 - User Account Control
-<text>
-Answer generation
-answer_mitre_docqa(question, topk, temperature, context=None) -> str:
-
-If context not given, calls build_mitre_context.
-
-Detects:
-
-whether the question wants mitigations
-
-whether it specifically is mitigation enumeration.
-
-If mitigations are requested:
-
-Use task block that forces:
-
-text
-Copy code
-- [M####] Mitigation_Name: 1–3 sentence description
-Only list mitigations present in context.
-
-No invented IDs/names.
-
-If mitigations are not requested:
-
-Simple explanatory answer from context, no extra “Mitigations” section.
-
-Backstop for enumeration:
-
-Extract all mitigation IDs from context and answer.
-
-For any missing IDs, append:
-
-text
-Copy code
-**Mitigations (additional from context)**
-- [M10xx] (present in context)
-Metadata extraction
-extract_meta_from_context(context: str) -> Dict[str, List[str]]:
-
-Pulls:
-
-Technique IDs seen in context.
-
-For each, fetches one chunk to read tactic_ids and platforms.
-
-Mitigation IDs seen in context.
-
-Returns:
-
-json
-Copy code
-{
-  "techniques": ["T1548", "T1548.002"],
-  "tactics": ["TA0004", "TA0005"],
-  "platforms": ["Windows", "Linux", ...],
-  "mitigations": ["M1052", "M1018", ...]
-}
-Used by /docqa API.
-
-7.2 MITRE-Mapper (Text/Alert → Techniques + Telemetry)
-File: src/mitre_expert/llm/mitre_mapper.py
-
-Goal: map log lines, alerts, CTI snippets → MITRE techniques + tactics + telemetry hints. No LLM involved; fully deterministic + semantic.
-
-Types:
-
-TechniquePrediction:
-
-id, name
-
-confidence (0–1, normalized per query)
-
-tactics: List[str]
-
-data_components: List[str]
-
-log_sources: List[str]
-
-MapperResult:
-
-text (input text)
-
-tactics: List[str] (deduped across predictions)
-
-techniques: List[TechniquePrediction]
-
-Key helpers:
-
-_fetch_technique_meta(technique_id) (cached):
-
-Uses get_mitre_chunks_by_filter(where={"technique_id": tid}, limit=1)
-
-Reads:
-
-technique_name
-
-tactic_ids
-
-data_component_ids
-
-log_source_names
-
-CSV fields are parsed into lists.
-
-_combine_scores(resolver_cands, semantic_cands):
-
-Start from resolver scores [0,1].
-
-Add semantic “booster” (normalized semantic scores × weight).
-
-_apply_priors(text, scores, observed_log_sources, observed_data_components):
-
-Lightweight priors:
-
-URL/proxy-ish text boosts network techniques (e.g. T1071).
-
-Auth/password-ish text boosts T1110, etc.
-
-Telemetry alignment:
-
-If observed_log_sources / observed_data_components passed:
-
-Techniques whose telemetry overlaps get a boost.
-
-Techniques with zero overlap get a small penalty.
-
-Main:
-
-map_text_to_techniques(text, max_techniques=5, observed_log_sources=None, observed_data_components=None) -> MapperResult:
-
-resolver_cands = resolve_techniques_from_text(...)
-
-semantic_cands = detect_techniques_from_query(...)
-
-raw_scores = _combine_scores(...)
-
-raw_scores = _apply_priors(...)
-
-Sort by score, keep top N, normalize so best = 1.0.
-
-For each technique:
-
-Use _fetch_technique_meta to populate:
-
-name
-
-tactic IDs
-
-telemetry (data_components, log_sources).
-
-Deduplicate tactics across all predictions.
-
-mapper_result_to_dict(result) makes this JSON-serializable.
-
-7.3 MITRE-Detect (Technique → Detection Ideas)
-File: src/mitre_expert/llm/mitre_detect.py
-
-Goal: given a technique ID (and optionally platform + available logs), generate detection guidance based on MITRE detection_strategy chunks.
-
-Detection context
-build_detection_context(technique_id, topk=8, available_logs=None) -> str:
-
-Normalize technique_id to upper-case.
-
-Normalize available_logs to a list of strings (or None).
-
-Try dedicated detection_strategy chunks:
-
-python
-Copy code
-det = get_mitre_chunks_by_filter(
-    where={"technique_id": technique_id, "section": "detection_strategy"},
-    limit=None,
-    logsource=available_logs,  # optional telemetry-aware filter
-)
-For each detection chunk:
-
-Build header:
-
-text
-Copy code
-T1548 - Abuse Elevation Control Mechanism | detection_strategy [AN0975] - Analytic 0975
-Append doc text.
-
-Extract telemetry from metadata:
-
-log_source_names
-
-data_component_ids
-
-Append a Telemetry: block:
-
-text
-Copy code
-Telemetry:
-- Log sources: WinEventLog:Security, WinEventLog:Sysmon, ...
-- Data components: DC0032, DC0088, ...
-If no detection_strategy chunks exist:
-
-Fallback:
-
-python
-Copy code
-result = search_mitre_chunks(
-    query=f"detection or logging for {technique_id}",
-    k=topk,
-    where={"technique_id": technique_id},
-    logsource=available_logs,
-)
-Emit generic headers [Txxxx - name | section] + text + telemetry hints (if present).
-
-If still nothing:
-
-Add "No detection-specific content found...".
-
-Answer generation
-answer_mitre_detect(technique_id, platform=None, available_logs=None, ...) -> str:
-
-Normalizes technique_id to upper case.
-
-If no context provided, builds one with build_detection_context().
-
-Builds an ENVIRONMENT block:
-
-text
-Copy code
-- platform: Windows
-- available_logs: WinEventLog:Security, WinEventLog:Sysmon
-User instructions:
-
-Restate detection goal.
-
-Log Sources section based on context.
-
-Detection Ideas (2–5) based only on context.
-
-Call out if context is weak.
-
-Prefer ideas that align with ENVIRONMENT; mention when context uses telemetry not available in ENVIRONMENT.
-
-Uses DETECT_SYSTEM_PROMPT + generate_answer.
-
-API maps temperature=0.0 → None (greedy).
-
-7.4 Answer Composer (Merge Results)
-File: src/mitre_expert/llm/answer_composer.py
-
-compose_answer(question, mapper_json=None, detect_answer=None, docqa_answer=None, primary_technique_id=None) -> dict:
-
-Build raw sections:
-
-python
-Copy code
-sections = {}
-if mapper_json: sections["mapping"] = mapper_json
-if docqa_answer: sections["docqa"] = {"answer": docqa_answer}
-if detect_answer: sections["detection"] = {"answer": detect_answer}
-Techniques:
-
-Start from mapper_json["techniques"] if present:
-
-Normalize IDs to upper-case.
-
-Deduplicate by ID, keep highest confidence and best name.
-
-If still no techniques but primary_technique_id exists:
-
-Add single technique with confidence 1.0.
-
-Tactics:
-
-If mapper provided tactics:
-
-Deduplicate and preserve order.
-
-Summary:
-
-mapper + detect:
-
-“The query appears related to MITRE techniques: ... Detection guidance is also provided...”
-
-mapper only:
-
-“The query appears related to MITRE techniques: ...”
-
-detect only:
-
-“Detection guidance for technique Txxxx.”
-
-docqa only:
-
-“Answer based on MITRE-DocQA.”
-
-None:
-
-“No specific MITRE techniques or detections could be identified.”
-
-Return dict suitable for API responses.
-
-8) API Endpoints & Flows
-8.1 /docqa
-File: src/mitre_expert/api/routers/mitre_docqa.py
-
-Request:
-
-json
-Copy code
-{
-  "question": "What is T1548? Which mitigations apply?",
-  "topk": 8,
-  "temperature": 0.2,
-  "include_context": false
-}
-Flow:
-
-ctx = build_mitre_context(question, topk).
-
-temp_for_llm = None if temperature == 0.0, else payload.temperature.
-
-answer = answer_mitre_docqa(question, topk, temperature=temp_for_llm, context=ctx).
-
-meta_raw = extract_meta_from_context(ctx) → DocQAMeta.
-
-Response:
-
-json
-Copy code
-{
-  "question": "...",
-  "answer": "...",
-  "context": "..."   // only if include_context=true
-  "meta": {
-    "techniques": ["T1548", "T1548.002"],
-    "tactics": ["TA0004", "TA0005"],
-    "platforms": ["Windows", "Linux", "..."],
-    "mitigations": ["M1018", "M1022", "..."]
-  }
-}
-8.2 /mapper
-File: src/mitre_expert/api/routers/mitre_mapper.py
-
-Request:
-
-json
-Copy code
-{
-  "text": "Repeated logon failures followed by a successful admin logon from same IP...",
-  "max_techniques": 5,
-  "observed_log_sources": ["WinEventLog:Security"],
-  "observed_data_components": ["DC0032"]
-}
-Flow:
-
-result = map_text_to_techniques(...) (with telemetry priors).
-
-data = mapper_result_to_dict(result).
-
-Response (simplified):
-
-json
-Copy code
-{
-  "tactics": ["TA0006", "TA0004"],
-  "techniques": [
-    {
-      "id": "T1110",
-      "name": "Brute Force",
-      "confidence": 0.97,
-      "tactics": ["TA0006"],
-      "data_components": ["DC0032", "..."],
-      "log_sources": ["WinEventLog:Security", "..."]
-    },
-    ...
-  ]
-}
-8.3 /detect
-File: src/mitre_expert/api/routers/mitre_detect.py
-
-Request:
-
-json
-Copy code
-{
-  "technique_id": "T1548",
-  "platform": "Windows",
-  "available_logs": ["WinEventLog:Security", "WinEventLog:Sysmon"],
-  "topk": 8,
-  "temperature": 0.2,
-  "include_context": false
-}
-Flow:
-
-ctx = build_detection_context(technique_id, topk, available_logs).
-
-Map temperature=0.0 → None (greedy).
-
-answer = answer_mitre_detect(technique_id, platform, available_logs, topk, temperature=temp_for_llm, context=ctx).
-
-Response:
-
-json
-Copy code
-{
-  "technique_id": "T1548",
-  "answer": "...",
-  "context": "..."   // only if include_context=true
-}
-8.4 /query (Smart Router Entry)
-File: src/router/router.py (conceptual)
-
-Request (simplified):
-
-json
-Copy code
-{
-  "query": "How do I detect abuse of UAC on Windows using Security and Sysmon logs?",
-  "max_techniques": 5,
-  "technique_id": null,
-  "platform": "Windows",
-  "available_logs": ["WinEventLog:Security", "WinEventLog:Sysmon"],
-  "include_raw_sections": true
-}
-Routing:
-
-route_query(query) uses heuristics:
-
-mapping-like terms:
-
-"log ", "logs ", "alert", "siem", "event id", "ioc", "hash", "ip ", "url ", "connection", "network flow"
-
-detect-like terms:
-
-"how to detect", "detection idea", "use case", "log source", "telemetry", "sigma"
-
-technique IDs:
-
-T####, T####.### matches
-
-Routing rules (conceptual):
-
-detect + technique ID → kind = "detect"
-
-mapping + detect → kind = "mapper_detect"
-
-mapping only → kind = "mapper"
-
-detect only → kind = "detect"
-
-otherwise → kind = "docqa"
-
-Execution:
-
-Initialize:
-
-mapper_json = None
-
-docqa_answer = None
-
-detect_answer = None
-
-top_technique_id = payload.technique_id (if provided)
-
-If kind in ("mapper", "mapper_detect"):
-
-Run mapper with telemetry:
-
-python
-Copy code
-mapper_result = map_text_to_techniques(
-    query,
-    max_techniques=payload.max_techniques,
-    observed_log_sources=payload.available_logs,
-    observed_data_components=None  # or from request
-)
-mapper_json = mapper_result_to_dict(mapper_result)
-If top_technique_id is still None and mapper produced techniques:
-
-Set top_technique_id from best candidate.
-
-If kind == "detect" and no technique_id yet:
-
-best = resolve_best_technique(query)
-
-If found, set top_technique_id = best.id.
-
-If kind in ("detect", "mapper_detect") and top_technique_id:
-
-Run Detect:
-
-python
-Copy code
-detect_answer = answer_mitre_detect(
-    technique_id=top_technique_id,
-    platform=payload.platform,
-    available_logs=payload.available_logs,
-    ...
-)
-DocQA enrichment:
-
-If kind == "docqa":
-
-docqa_answer = answer_mitre_docqa(question=query, ...)
-
-If kind in ("mapper_detect", "detect"):
-
-If top_technique_id:
-
-Explanatory DocQA:
-
-python
-Copy code
-docqa_answer = answer_mitre_docqa(
-    question=f"Explain {top_technique_id} in simple language.",
-    ...
-)
-(Or use original question if desired.)
-
-If kind == "mapper" and no detect_answer:
-
-Optionally call DocQA with top technique.
-
-Compose answer:
-
-python
-Copy code
-composed = compose_answer(
-    question=query,
-    mapper_json=mapper_json,
-    detect_answer=detect_answer,
-    docqa_answer=docqa_answer,
-    primary_technique_id=top_technique_id,
-)
-Include or drop raw sections depending on include_raw_sections.
-
-Response:
-
-json
-Copy code
-{
-  "question": composed["question"],
-  "summary": composed["summary"],
-  "tactics": composed["tactics"],
-  "techniques": composed["techniques"],
-  "sections": composed["sections"],     // or null
-  "route_kind": decision.kind,
-  "route_reasons": decision.reasons
-}
-9) Developer Onboarding (Short, Practical)
-This is a compressed view; the full architecture is above.
-
-9.1 One-time build
-Build knowledge pack
-
-bash
-Copy code
-./scripts/run_build_mitre_knowledge_pack.sh
-Input: data/raw/mitre/*
-
-Output: data/processed/mitre/mitre_chunks_v1.jsonl
-
-Index into Chroma
-
-bash
-Copy code
-./scripts/run_index_mitre_chroma.sh
-Reads: mitre_chunks_v1.jsonl
-
-Writes: data/embeddings/mitre/chroma/
-
-9.2 Run the API
-bash
-Copy code
-./scripts/run_mitre_docqa_api.sh
-FastAPI exposes:
-
-/query — smart router entrypoint (recommended)
-
-/docqa — direct MITRE-DocQA
-
-/mapper — direct MITRE-Mapper (no LLM)
-
-/detect — direct MITRE-Detect
-
-9.3 Runtime Mental Model
-/query → route_query(...) decides:
-
-docqa (encyclopedia Q&A)
-
-mapper (mapping only)
-
-detect (detection only)
-
-mapper_detect (mapping + detection)
-
-Each specialist uses:
-
-The same Chroma index (mitre_chunks_v1)
-
-The same MITRE chunk file for resolver/vocab
-
-The same local LLM (generate_answer)
-
-9.4 Common Debugging
-Route confusion?
-
-Check route_kind + route_reasons in /query response.
-
-Empty technique names?
-
-Ensure mitre_chunks_v1.jsonl has technique_name populated.
-
-Check _fetch_technique_meta and Chroma metadata.
-
-Mitigation enumeration off?
-
-Confirm question triggers _is_mitigation_enumeration_question.
-
-Inspect build_mitre_context() output (include_context=true).
-
-Weird mapping?
-
-Inspect resolver_cands vs semantic_cands.
-
-Telemetry priors use observed_log_sources / observed_data_components;
-adjust or disable if they over-bias.
-
+The MITRE Expert Layer provides a solid foundation for building advanced AI-driven SOC capabilities while preserving analyst trust and technical correctness.
