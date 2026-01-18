@@ -1,702 +1,412 @@
-MITRE Knowledge Pack & Chunks — Data Model v1
+Cyber LLM Engine – MITRE Knowledge Pack
+Data Architecture & Processing (V1)
+1. Purpose of This Document
 
-This document describes how the MITRE knowledge pack and RAG chunks are built and structured.
+This document explains what the MITRE Knowledge Pack is, why it exists, how it is built, and how it is used inside the Cyber LLM Engine.
 
-These are the core artifacts:
+It is written so that:
 
-Input (preferred)
-data/processed/mitre/techniques_full_enriched_v2.jsonl
+A new engineer, SOC analyst, or architect
 
-Input (fallback)
-data/raw/mitre/techniques_full.jsonl
+With no prior exposure to this project
 
-Builder script
-src/mitre_expert/knowledge_pack/build_knowledge_pack.py
+Can fully understand the data layer that powers all MITRE intelligence
 
-Outputs (runtime source of truth)
+2. What Is the MITRE Knowledge Pack?
 
-data/processed/mitre/mitre_knowledge_pack_v1.jsonl ← normalized techniques
+The MITRE Knowledge Pack is the canonical, normalized, machine-readable representation of the MITRE ATT&CK framework used by this project.
 
-data/processed/mitre/mitre_chunks_v1.jsonl ← exploded chunks for RAG
+It is not raw MITRE data.
 
-Everything downstream (Chroma, resolver, Mapper, Detect, DocQA) sits on top of these files.
+It is:
 
-1. Builder: build_knowledge_pack.py
+Cleaned
 
-Path: src/mitre_expert/knowledge_pack/build_knowledge_pack.py
+Normalized
 
-1.1 Input path selection
-ENRICHED_TECHNIQUES_PATH = Path("data/processed/mitre/techniques_full_enriched_v2.jsonl")
-RAW_TECHNIQUES_FALLBACK_PATH = Path("data/raw/mitre/techniques_full.jsonl")
+Enriched
 
-def _pick_input_path() -> Path:
-    if ENRICHED_TECHNIQUES_PATH.exists():
-        return ENRICHED_TECHNIQUES_PATH
-    return RAW_TECHNIQUES_FALLBACK_PATH
+Chunked
 
+Designed for RAG (Retrieval-Augmented Generation)
 
-Prefer enriched techniques: techniques_full_enriched_v2.jsonl
+The Knowledge Pack is the single source of truth for:
 
-If missing, use raw: techniques_full.jsonl
+MITRE DocQA
 
-1.2 Supported input formats
-def _load_raw_techniques(path: Path) -> Iterator[Dict[str, Any]]:
-    """
-    Supports:
-    - {"techniques": [ {...}, {...} ]}
-    - [ {...}, {...} ]
-    - JSONL (one technique JSON object per line).
-    """
+MITRE Mapper
 
+MITRE Detect
 
-Accepted shapes:
+Any future MITRE-based intelligence
 
-Single JSON object with techniques array
+3. Why a Knowledge Pack Is Necessary
+3.1 Problems with Raw MITRE Data
 
-{
-  "techniques": [
-    { "..technique.." },
-    { "..technique.." }
-  ]
-}
+Raw MITRE ATT&CK data is:
 
+Highly nested
 
-JSON array of techniques
+Inconsistent across versions
 
-[
-  { "..technique.." },
-  { "..technique.." }
-]
+Difficult to query semantically
 
+Not optimized for LLM context windows
 
-JSONL: one technique per line
+Not telemetry-aware by default
 
-{"technique_id": "T1548", ...}
-{"technique_id": "T1548.002", ...}
-...
+LLMs cannot reason safely or efficiently over raw ATT&CK JSON.
 
+3.2 Design Goals of the Knowledge Pack
 
-If full-file JSON fails or has an unexpected top-level shape, the loader falls back to JSONL parsing.
+The Knowledge Pack solves this by ensuring:
 
-1.3 High-level build flow
-def build_knowledge_pack() -> None:
-    input_path = _pick_input_path()
-    raw_iter = list(_load_raw_techniques(input_path))
+Deterministic Structure
+Every technique looks the same internally.
 
-    # 1) Normalize raw → TechniqueRecord
-    technique_records: list[TechniqueRecord] = []
-    for rec in raw_iter:
-        try:
-            t = TechniqueRecord.from_raw(rec)
-            technique_records.append(t)
-        except KeyError as e:
-            print(f"[warn] Skipping record due to missing key: {e}")
-            continue
+LLM-Friendly Chunking
+Content is split into small, meaningful units.
 
-    # 2) Write normalized techniques
-    technique_dicts = (t.to_dict() for t in technique_records)
-    n_techniques = _write_jsonl(KNOWLEDGE_PACK_PATH, technique_dicts)
+Telemetry Awareness
+Each chunk carries log source and data component metadata.
 
-    # 3) Explode techniques into chunks
-    def chunk_dicts() -> Iterable[Dict[str, Any]]:
-        for t in technique_records:
-            for chunk in t.iter_chunks():
-                if not chunk.text or not chunk.text.strip():
-                    continue
-                yield chunk.to_dict()
+Traceability
+Every chunk can be traced back to its original MITRE source.
 
-    n_chunks = _write_jsonl(CHUNKS_PATH, chunk_dicts())
+Future Extensibility
+Supports enrichment, analytics, and multi-dataset fusion.
 
+4. File Outputs (What Gets Generated)
 
-Outputs:
+The MITRE Knowledge Pack produces two primary artifacts:
 
-KNOWLEDGE_PACK_PATH = data/processed/mitre/mitre_knowledge_pack_v1.jsonl
+data/processed/mitre/
+├── mitre_knowledge_pack_v1.jsonl
+└── mitre_chunks_v1.jsonl
 
-CHUNKS_PATH = data/processed/mitre/mitre_chunks_v1.jsonl
 
-2. Input: Enriched technique records
+These files serve different purposes and must not be confused.
 
-File: data/processed/mitre/techniques_full_enriched_v2.jsonl
-Shape: one technique JSON object per line, e.g.:
+5. mitre_knowledge_pack_v1.jsonl
+5.1 What This File Is
 
-{
-  "technique_id": "T1548",
-  "technique_name": "Abuse Elevation Control Mechanism",
-  "description": "Adversaries may circumvent mechanisms designed to control elevate privileges to gain higher-level permissions...",
-  "url": "https://attack.mitre.org/techniques/T1548",
-  "domain": "enterprise-attack",
+This file contains one JSON object per MITRE ATT&CK technique.
 
-  "tactics": [
-    {
-      "tactic_id": "TA0005",
-      "tactic_name": "Defense Evasion",
-      "tactic_description": "...",
-      "tactic_url": "https://attack.mitre.org/tactics/TA0005"
-    },
-    {
-      "tactic_id": "TA0004",
-      "tactic_name": "Privilege Escalation",
-      "tactic_description": "...",
-      "tactic_url": "https://attack.mitre.org/tactics/TA0004"
-    }
-  ],
+Each line represents a fully normalized technique record, including:
 
-  "platforms": "IaaS, Identity Provider, Linux, Office Suite, Windows, macOS",
-  "is_sub_technique": false,
-  "sub_technique_of": null,
+Metadata
 
-  "procedure_examples": [ ... ],
-  "associated_mitigations": [ ... ],
-  "associated_detection_strategies": [ ... ],
+Description
 
-  "data_components": [ ... ],
-  "data_component_ids": ["DC0032", "DC0088", "..."],
-  "log_source_names": [
-    "WinEventLog:Security",
-    "fs:fsusage",
-    "WinEventLog:Sysmon",
-    "auditd:SYSCALL",
-    "AWS:CloudTrail",
-    "macos:unifiedlog",
-    "azure:signinlogs"
-  ]
-}
+Procedures
 
+Mitigations
 
-Example sub-technique (T1548.002) follows the same shape plus:
+Detection strategies
 
-"is_sub_technique": true,
-"sub_technique_of": "T1548"
+Telemetry enrichment
 
+This is the authoritative internal representation of ATT&CK.
 
-Key enrichments:
+5.2 What This File Is NOT
 
-Full tactic objects
+It is:
 
-Rich procedure_examples (campaigns, groups, software)
+❌ Not embedded
 
-Rich associated_mitigations
+❌ Not directly queried by the LLM
 
-Rich associated_detection_strategies (with per-analytic descriptions)
+❌ Not used for semantic search
 
-Telemetry:
+Instead, it is used to:
 
-data_components with nested log_sources
+Generate RAG chunks
 
-Flattened data_component_ids
+Enable deterministic lookups
 
-Flattened log_source_names
+Support future analytics and exports
 
-The builder uses this enriched structure to generate normalized techniques and then chunks.
+5.3 TechniqueRecord Structure
 
-3. Normalized techniques: mitre_knowledge_pack_v1.jsonl
+Each line maps to the following conceptual structure:
 
-TechniqueRecord.from_raw(...) normalizes a raw/enriched technique into a clean record, then to_dict() is written to JSONL.
+TechniqueRecord
+├── technique_id
+├── technique_name
+├── domain
+├── url
+├── tactics
+├── platforms
+├── telemetry enrichment
+│   ├── data_component_ids
+│   └── log_source_names
+├── description
+├── procedure_examples[]
+├── associated_mitigations[]
+└── associated_detection_strategies[]
 
-Conceptual schema:
+5.4 Telemetry Enrichment (Critical Design Choice)
 
-{
-  "technique_id": "T1548",
-  "technique_name": "Abuse Elevation Control Mechanism",
-  "description": "Adversaries may circumvent mechanisms...",
-  "url": "https://attack.mitre.org/techniques/T1548",
-  "domain": "enterprise-attack",
+Each technique includes:
 
-  "tactic_ids": ["TA0005", "TA0004"],
-  "tactic_names": ["Defense Evasion", "Privilege Escalation"],
+MITRE Data Component IDs (e.g. DC0002)
 
-  "platforms": [
-    "IaaS",
-    "Identity Provider",
-    "Linux",
-    "Office Suite",
-    "Windows",
-    "macOS"
-  ],
+Log Source Names (e.g. WinEventLog:Security)
 
-  "is_sub_technique": false,
-  "sub_technique_of": null,
+These fields are propagated to every chunk later.
 
-  "procedure_examples": [ ... ],            // structured from input
-  "associated_mitigations": [ ... ],        // structured from input
-  "associated_detection_strategies": [ ... ],
+This enables:
 
-  "data_component_ids": ["DC0032", "DC0088", "..."],
-  "log_source_names": [
-    "WinEventLog:Security",
-    "fs:fsusage",
-    "WinEventLog:Sysmon",
-    "auditd:SYSCALL",
-    "AWS:CloudTrail",
-    "macos:unifiedlog",
-    "azure:signinlogs"
-  ]
-}
+Log-aware retrieval
 
+Detection biasing
 
-Normalization notes:
+SOC-relevant answers
 
-platforms: normalized to a list (even if input is a comma-separated string).
+Without this, detection guidance would be generic and weak.
 
-tactic_ids / tactic_names: flattened from tactics objects.
+6. mitre_chunks_v1.jsonl
+6.1 What This File Is
 
-data_components (full structure) are not kept here; instead we keep:
+This file contains RAG-ready chunks, not full techniques.
 
-data_component_ids
+Each line is a ChunkRecord, designed to:
 
-log_source_names
+Be embedded into Chroma
 
-File format:
+Fit inside LLM context windows
 
-data/processed/mitre/mitre_knowledge_pack_v1.jsonl
+Represent one semantic idea
 
-One normalized technique per line.
+This is the primary runtime dataset.
 
-This file is primarily for inspection / docs; the RAG layer uses the chunk file.
+6.2 Why Chunking Is Necessary
 
-4. RAG chunks: mitre_chunks_v1.jsonl
+LLMs cannot safely reason over:
 
-TechniqueRecord.iter_chunks() explodes a technique into multiple ChunkRecord objects.
+Entire techniques
 
-Each chunk:
+Entire frameworks
 
-Belongs to exactly one technique.
+Chunking allows:
 
-Represents one section: description, procedure example, mitigation, or detection strategy.
+Precision retrieval
 
-Carries key metadata used by:
+Lower hallucination risk
 
-Chroma RAG
+Section-aware reasoning (mitigations vs detection)
 
-Technique resolver
+6.3 Chunk Types
 
-Mapper
+Each technique is split into multiple chunk types:
 
-Detect
+Section	Purpose
+description	What the technique is
+procedure_example	How attackers use it
+mitigation	How to mitigate it
+detection_strategy	How to detect it
 
-DocQA
+Each chunk is self-contained and meaningful.
 
-4.1 ChunkRecord schema (conceptual)
-{
-  "chunk_id": "T1548_desc",
+6.4 ChunkRecord Structure
 
-  "technique_id": "T1548",
-  "technique_name": "Abuse Elevation Control Mechanism",
+Each chunk contains:
 
-  "section": "description",  // or "procedure_example" | "mitigation" | "detection_strategy"
-  "text": "Adversaries may circumvent mechanisms designed to control elevate privileges...",
+ChunkRecord
+├── chunk_id
+├── technique_id
+├── technique_name
+├── section
+├── text
+├── tactics
+├── platforms
+├── telemetry enrichment
+│   ├── data_component_ids
+│   └── log_source_names
+├── optional mitigation metadata
+└── optional detection metadata
 
-  "tactic_ids": ["TA0005", "TA0004"],
-  "tactic_names": ["Defense Evasion", "Privilege Escalation"],
-  "platforms": ["IaaS", "Identity Provider", "Linux", "Office Suite", "Windows", "macOS"],
 
-  "data_component_ids": ["DC0032", "DC0088", "..."],
-  "log_source_names": [
-    "WinEventLog:Security",
-    "fs:fsusage",
-    "WinEventLog:Sysmon",
-    "auditd:SYSCALL",
-    "AWS:CloudTrail",
-    "macos:unifiedlog",
-    "azure:signinlogs"
-  ],
+This metadata is essential for:
 
-  // Optional linkouts depending on section:
-  "procedure_source_id": null,
-  "procedure_source_name": null,
-  "procedure_source_type": null,
+Filtering
 
-  "mitigation_id": null,
-  "mitigation_name": null,
+Biasing
 
-  "analytic_id": null,
-  "analytic_name": null
-}
+Deterministic retrieval
 
+7. Chunk ID Strategy
 
-Invariants:
+Chunk IDs are deterministic and human-readable:
 
-Every chunk has:
+T1059_desc
+T1059_proc_1
+T1059_mit_M1052
+T1059_det_AN0001
 
-technique_id
 
-technique_name
+This enables:
 
-section
+Debugging
 
-text (non-empty)
+Traceability
 
-Telemetry (data_component_ids, log_source_names) is copied from the parent technique.
+Safe deterministic retrieval
 
-A chunk may additionally bind to:
+8. Knowledge Pack Build Pipeline
+8.1 Input Sources
 
-One mitigation (mitigation_id, mitigation_name)
+The build process consumes:
 
-One analytic (analytic_id, analytic_name)
+Raw MITRE ATT&CK technique data
 
-One procedure source (procedure_source_id, procedure_source_name, procedure_source_type)
+Optional enriched ATT&CK exports
 
-5. Chunk types
-5.1 Description chunks
+Telemetry mappings
 
-One per technique, from description.
+8.2 Build Flow (Step by Step)
+Raw MITRE Data
+   ↓
+TechniqueRecord.from_raw()
+   ↓
+Normalization & Enrichment
+   ↓
+mitre_knowledge_pack_v1.jsonl
+   ↓
+TechniqueRecord.iter_chunks()
+   ↓
+mitre_chunks_v1.jsonl
 
-Example:
+8.3 Why Two Files?
+File	Role
+knowledge_pack	Canonical source of truth
+chunks	Runtime RAG dataset
 
-{
-  "chunk_id": "T1548_desc",
-  "technique_id": "T1548",
-  "technique_name": "Abuse Elevation Control Mechanism",
-  "section": "description",
-  "text": "Adversaries may circumvent mechanisms designed to control elevate privileges...",
-  "tactic_ids": ["TA0005", "TA0004"],
-  "tactic_names": ["Defense Evasion", "Privilege Escalation"],
-  "platforms": ["IaaS", "Identity Provider", "Linux", "Office Suite", "Windows", "macOS"],
-  "data_component_ids": ["DC0032", "DC0088", "..."],
-  "log_source_names": ["WinEventLog:Security", "fs:fsusage", "..."],
-  "procedure_source_id": null,
-  "procedure_source_name": null,
-  "procedure_source_type": null,
-  "mitigation_id": null,
-  "mitigation_name": null,
-  "analytic_id": null,
-  "analytic_name": null
-}
+This separation avoids:
 
+Data duplication
 
-chunk_id convention:
-<TECH_ID>_desc
+Accidental mutation
 
-5.2 Procedure example chunks
+Loss of rich structure
 
-For each entry in procedure_examples, create a chunk:
+9. How the Knowledge Pack Is Used at Runtime
+9.1 MITRE DocQA
 
-{
-  "chunk_id": "T1548_proc_G1048",
-  "technique_id": "T1548",
-  "technique_name": "Abuse Elevation Control Mechanism",
-  "section": "procedure_example",
+Semantic search over chunks
 
-  "text": "[UNC3886] has used vSphere Installation Bundles (VIBs)...\n\n[UNC3886] is a China-nexus cyberespionage group...",
+Deterministic retrieval for mitigations
 
-  "procedure_source_id": "G1048",
-  "procedure_source_name": "UNC3886",
-  "procedure_source_type": "group",
+Metadata extraction (tactics, platforms)
 
-  "mitigation_id": null,
-  "mitigation_name": null,
-  "analytic_id": null,
-  "analytic_name": null,
+9.2 MITRE Mapper
 
-  "tactic_ids": [...],
-  "tactic_names": [...],
-  "platforms": [...],
-  "data_component_ids": [...],
-  "log_source_names": [...]
-}
+Uses chunks for semantic similarity
 
+Uses telemetry metadata for priors
 
-chunk_id convention:
-<TECH_ID>_proc_<SOURCE_ID>
+Uses knowledge pack for name resolution
 
-5.3 Mitigation chunks
+9.3 MITRE Detect
 
-For each entry in associated_mitigations, create one chunk.
+Prefers detection_strategy chunks
 
-Pattern:
+Filters by log source availability
 
-{
-  "chunk_id": "T1548_mit_M1047",
-  "technique_id": "T1548",
-  "technique_name": "Abuse Elevation Control Mechanism",
-  "section": "mitigation",
+Falls back gracefully if data is missing
 
-  "text": "<mapping_description>\n\n<mitigation_source_description>",
+10. Safety & Anti-Hallucination Design
 
-  "mitigation_id": "M1047",
-  "mitigation_name": "Audit",
+The Knowledge Pack enforces safety by:
 
-  "procedure_source_id": null,
-  "procedure_source_name": null,
-  "procedure_source_type": null,
-  "analytic_id": null,
-  "analytic_name": null,
+Small, scoped chunks
 
-  "tactic_ids": [...],
-  "tactic_names": [...],
-  "platforms": [...],
-  "data_component_ids": [...],
-  "log_source_names": [...]
-}
+Explicit section labeling
 
+Telemetry-aware metadata
 
-chunk_id convention:
-<TECH_ID>_mit_<MIT_ID>
+Deterministic fallback logic
 
-This applies for all mitigations tied to a technique, e.g. for T1548: M1047, M1038, M1028, M1026, M1022, M1051, M1052, M1018, etc.
+Prompt-level enforcement
 
-5.4 Detection strategy chunks
+The LLM cannot invent data that does not exist in the pack.
 
-For each analytic inside each entry of associated_detection_strategies, create a detection chunk.
+11. What Is Missing (V1 Data Gaps)
+11.1 No Versioning Metadata
 
-Example (T1548):
+There is no explicit:
 
-{
-  "chunk_id": "T1548_det_AN0975",
-  "technique_id": "T1548",
-  "technique_name": "Abuse Elevation Control Mechanism",
-  "section": "detection_strategy",
+ATT&CK version
 
-  "text": "Detection Strategy for Abuse Elevation Control Mechanism (T1548)\n\nCorrelate registry modifications (e.g., UAC bypass registry keys), unusual parent-child process relationships (e.g., control.exe spawning cmd.exe), and unsigned elevated process executions with non-standard tokens or elevation flags.",
+Build timestamp
 
-  "analytic_id": "AN0975",
-  "analytic_name": "Analytic 0975",
+Source hash
 
-  "procedure_source_id": null,
-  "procedure_source_name": null,
-  "procedure_source_type": null,
-  "mitigation_id": null,
-  "mitigation_name": null,
+This should be added in V2.
 
-  "tactic_ids": [...],
-  "tactic_names": [...],
-  "platforms": [...],
-  "data_component_ids": [...],
-  "log_source_names": [...]
-}
+11.2 No Confidence Scoring
 
+Chunks do not currently include:
 
-chunk_id convention:
-<TECH_ID>_det_<ANALYTIC_ID>
+Reliability indicators
 
-Example for T1548.002:
+Source confidence
 
-T1548.002_det_AN1094 with a similar pattern.
+11.3 No Cross-Technique Relations
 
-6. Telemetry fields: data components & log sources
+Relationships such as:
 
-Telemetry from the enriched techniques file is propagated to all chunks.
+Parent/sub-technique graphs
 
-6.1 In input
+Kill-chain flows
+are not yet materialized.
 
-For a technique record:
+11.4 No D3FEND Integration Here
 
-"data_components": [
-  {
-    "data_component_id": "DC0032",
-    "data_component_stix_id": "x-mitre-data-component--...",
-    "log_sources": [
-      { "name": "WinEventLog:Security", "channel": "EventCode=4688" }
-    ]
-  },
-  {
-    "data_component_id": "DC0059",
-    "data_component_stix_id": "x-mitre-data-component--...",
-    "log_sources": [
-      { "name": "auditd:SYSCALL", "channel": "setuid or setgid bit changes" }
-    ]
-  },
-  ...
-],
-"data_component_ids": ["DC0032", "DC0088", "DC0063", "DC0059", "DC0034", "DC0021", "DC0010"],
-"log_source_names": [
-  "WinEventLog:Security",
-  "fs:fsusage",
-  "WinEventLog:Sysmon",
-  "auditd:SYSCALL",
-  "AWS:CloudTrail",
-  "macos:unifiedlog",
-  "azure:signinlogs"
-]
+D3FEND uses a separate pipeline and is not yet merged.
 
-6.2 In normalized techniques
+12. Intended Future Enhancements
 
-data_component_ids: list of strings
+Planned improvements include:
 
-log_source_names: list of strings
+Versioned knowledge packs
 
-The richer data_components object is only used in the build step; the flat lists are what we use at runtime.
+Multi-domain ATT&CK support
 
-6.3 In chunks
+ATT&CK ↔ D3FEND linking
 
-Every chunk for a technique copies:
+Detection rule references (Sigma)
 
-"data_component_ids": [...],
-"log_source_names": [...]
+SOC-tier-aware metadata
 
+Graph-based representations
 
-This allows:
+13. Final Summary
 
-Mapper to reason about which techniques align with observed telemetry.
+The MITRE Knowledge Pack is the foundation of trust in this system.
 
-Detect to focus on detection_strategy chunks whose telemetry matches the environment:
+It transforms MITRE ATT&CK from:
 
-intersection of available_logs (e.g., "Proxy", "Firewall", "WinEventLog:Security") with log_source_names.
+“A large static framework”
 
-later—if desired—also intersection with data_component_ids (e.g. "DC0002" for authentication logs).
+Into:
 
-7. How the chunks are used at runtime
-7.1 Chroma index
+“A machine-readable, LLM-safe, SOC-ready intelligence layer”
 
-data/processed/mitre/mitre_chunks_v1.jsonl feeds:
+Without it:
 
-src/mitre_expert/rag/index_chroma.py
+RAG would be unreliable
 
-For each chunk:
+Detection guidance would be vague
 
-document = text
+Mapping would be noisy
 
-metadata = sanitized subset of chunk fields:
+Hallucinations would be inevitable
 
-technique_id, technique_name
+With it:
 
-section
+Every answer is traceable
 
-mitigation_id, mitigation_name
+Every detection is grounded
 
-analytic_id, analytic_name
-
-tactic_ids, tactic_names
-
-platforms
-
-data_component_ids, log_source_names
-
-plus internal chunk_id / source if needed
-
-Chroma collection is then used by query_chroma.py for:
-
-get_mitre_chunks_by_filter(...)
-
-search_mitre_chunks(...)
-
-detect_techniques_from_query(...)
-
-auto_search_mitre_chunks(...)
-
-7.2 Technique resolver
-
-src/mitre_expert/models/technique_resolver.py:
-
-Loads mitre_chunks_v1.jsonl.
-
-Extracts (technique_id, technique_name) from chunk metadata.
-
-Builds in-memory vocab:
-
-ID regex (T####, T####.###)
-
-normalized name substring
-
-optional fuzzy match (rapidfuzz)
-
-This resolver drives:
-
-mapping decisions for /mapper and /query
-
-best-technique selection when user asks for detection on free-text queries
-
-7.3 MITRE specialists
-
-MITRE-DocQA
-
-Uses section for context selection.
-
-For mitigation enumeration: focuses on section="mitigation" chunks and their mitigation_id / mitigation_name.
-
-MITRE-Mapper
-
-Uses technique/tactic metadata plus telemetry (data_component_ids, log_source_names) to produce structured mappings like:
-
-T1110, T1110.001, T1110.003, T1110.004, T1078.002 for authentication anomalies.
-
-MITRE-Detect
-
-Uses section="detection_strategy" chunks.
-
-Reads analytic_id / analytic_name for headings.
-
-Intersects telemetry in chunks with platform + available_logs from the request to steer detection ideas.
-
-8. Rebuilding & debugging
-8.1 Rebuild knowledge pack
-
-From repo root:
-
-# Build normalized techniques + chunks
-python -m mitre_expert.knowledge_pack.build_knowledge_pack
-
-# Or via helper script
-./scripts/run_build_mitre_knowledge_pack.sh
-
-
-This regenerates:
-
-data/processed/mitre/mitre_knowledge_pack_v1.jsonl
-
-data/processed/mitre/mitre_chunks_v1.jsonl
-
-Then re-index embeddings:
-
-./scripts/run_index_mitre_chroma.sh
-
-8.2 Quick checks
-
-If no input file is found:
-
-Ensure at least one of:
-
-data/processed/mitre/techniques_full_enriched_v2.jsonl
-
-data/raw/mitre/techniques_full.jsonl
-
-If chunks file is tiny or empty:
-
-Look for [warn] Skipping record due to missing key in build logs.
-
-Ensure technique records actually have descriptions/mitigations/detections; empty text gets skipped.
-
-To verify a technique, e.g. T1548:
-
-grep '"technique_id": "T1548"' data/processed/mitre/mitre_chunks_v1.jsonl
-
-You should see:
-
-T1548_desc
-
-T1548_proc_*
-
-T1548_mit_*
-
-T1548_det_*
-
-9. Summary
-
-The enriched techniques file is the input.
-
-build_knowledge_pack.py:
-
-Normalizes techniques → mitre_knowledge_pack_v1.jsonl
-
-Explodes them into chunks → mitre_chunks_v1.jsonl
-
-Each chunk:
-
-Is bound to a single technique
-
-Represents a section (description / procedure / mitigation / detection_strategy)
-
-Carries tactics, platforms, and telemetry (data_component_ids, log_source_names)
-
-Optionally binds to a mitigation, analytic, or procedure source
-
-At runtime:
-
-Chroma indexes chunks.
-
-Technique resolver builds vocabulary from chunks.
-
-DocQA / Mapper / Detect all operate on this unified chunk representation.
-
-Design rule of thumb:
-If you change the shape or semantics of the MITRE data, update the builder → regenerate the knowledge pack → re-index Chroma. The entire “MITRE expert layer” is downstream of this pipeline.
+Every explanation is defensible

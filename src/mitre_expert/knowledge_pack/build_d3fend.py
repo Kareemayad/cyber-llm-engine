@@ -1,4 +1,4 @@
-#src/mitre_expert/knowledge_pack/build_d3fend.py
+#src\mitre_expert\knowledge_pack\build_d3fend.py
 """
 build_d3fend_normalized.py
 
