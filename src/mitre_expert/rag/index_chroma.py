@@ -1,3 +1,4 @@
+#src/mitre_expert/rag/index_chroma.py
 """
 Index RAG chunks into ChromaDB with pluggable embedding backends.
 
@@ -13,6 +14,7 @@ FIXES:
 - Issue 1: Now captures both analytic_id and analytic_stix_id
 - Issue 2: Now stores analytic-level telemetry fields for proper ranking
 - Issue 3: Now captures D3FEND primary_attack_technique for per-technique retrieval
+- Issue 4: Indexes D3FEND synonyms as metadata for hybrid/keyword search
 """
 
 from __future__ import annotations
@@ -168,13 +170,13 @@ def _load_chunks(path: Path) -> Iterable[Dict[str, Any]]:
 def _sanitize_metadata(meta: Dict[str, Any]) -> Dict[str, Any]:
     """
     Ensure Chroma-compatible metadata types.
-    
+
     Chroma only supports: str, int, float, bool
     Lists/sets/tuples are joined into comma-separated strings.
     Dicts and complex objects are dropped (not queryable anyway).
     """
     safe: Dict[str, Any] = {}
-    
+
     for k, v in meta.items():
         if v is None:
             continue
@@ -194,7 +196,6 @@ def _sanitize_metadata(meta: Dict[str, Any]) -> Dict[str, Any]:
 
         # Dicts: skip (too complex for Chroma metadata)
         if isinstance(v, dict):
-            # Could stringify, but not useful for queries
             continue
 
         # Fallback: stringify
@@ -208,10 +209,11 @@ def _sanitize_metadata(meta: Dict[str, Any]) -> Dict[str, Any]:
 def _build_metadata_from_record(rec: Dict[str, Any], dataset_key: str) -> Dict[str, Any]:
     """
     Build metadata dict for BOTH MITRE and D3FEND chunks.
-    
+
     FIX Issue 1: Now captures both analytic_stix_id AND analytic_id
     FIX Issue 2: Now captures analytic-level telemetry fields
     FIX Issue 3: Now captures D3FEND primary_attack_technique
+    FIX Issue 4: Now captures D3FEND synonyms (and synonyms_text) for hybrid/keyword search
     """
     section = rec.get("section") or "unknown"
     chunk_id = rec.get("chunk_id") or rec.get("id")
@@ -235,38 +237,38 @@ def _build_metadata_from_record(rec: Dict[str, Any], dataset_key: str) -> Dict[s
         "tactic_ids",
         "tactic_names",
         "platforms",
-        
+
         # Technique-level telemetry
         "data_component_ids",
         "log_source_names",
-        
+
         # Mitigation metadata
         "mitigation_id",
         "mitigation_name",
-        
+
         # Procedure metadata
         "procedure_source_id",
         "procedure_source_name",
         "procedure_source_type",
-        
+
         # Detection strategy metadata
         "detection_strategy_stix_id",
         "detection_strategy_name",
-        
+
         # Analytic metadata (FIX Issue 1)
         "analytic_stix_id",
         "analytic_name",
-        
+
         # Analytic-level telemetry (FIX Issue 2)
         "analytic_data_component_ids",
         "analytic_log_source_names",
         # NOTE: analytic_log_source_references is List[Dict], not indexable
     ]
-    
+
     for k in mitre_fields:
         if k in rec and rec[k] is not None:
             meta_raw[k] = rec[k]
-    
+
     # FIX Issue 1: Set analytic_id as alias for analytic_stix_id
     if "analytic_stix_id" in rec and rec["analytic_stix_id"]:
         meta_raw["analytic_id"] = rec["analytic_stix_id"]
@@ -279,19 +281,38 @@ def _build_metadata_from_record(rec: Dict[str, Any], dataset_key: str) -> Dict[s
         "d3fend_id",
         "label",
         "uri",
-        
+
         # ATT&CK technique mappings
         "attack_techniques",
         "primary_attack_technique",  # FIX Issue 3: Per-technique mapping
-        
+
         # Relations
         "relation_types",
         "related_uris",
+
+        # FIX Issue 4: Synonyms for keyword/hybrid search
+        "synonyms",
     ]
-    
+
     for k in d3fend_fields:
         if k in rec and rec[k] is not None:
             meta_raw[k] = rec[k]
+
+    # FIX Issue 4: Add synonyms_text (robust string field for metadata keyword filtering)
+    syns = rec.get("synonyms")
+    syn_list: List[str] = []
+    if syns is None:
+        syn_list = []
+    elif isinstance(syns, (list, tuple, set)):
+        syn_list = [str(s).strip() for s in syns if s is not None and str(s).strip()]
+    else:
+        s = str(syns).strip()
+        syn_list = [s] if s else []
+
+    if syn_list:
+        # keep raw list too (will be sanitized to comma-separated string)
+        meta_raw["synonyms"] = syn_list
+        meta_raw["synonyms_text"] = ", ".join(syn_list)
 
     return _sanitize_metadata(meta_raw)
 
@@ -313,12 +334,12 @@ def _select_datasets(target: str) -> List[DatasetConfig]:
     t = (target or "mitre").strip().lower()
     if t == "all":
         return DATASETS
-    
+
     # Try to find by key
     config = get_dataset_config(t)
     if config:
         return [config]
-    
+
     # Not found
     valid = ", ".join(get_all_dataset_keys()) + ", all"
     raise ValueError(f"Unknown target={target!r}. Valid: {valid}")
@@ -336,7 +357,7 @@ def _index_dataset(
 ) -> Dict[str, Any]:
     """
     Index a single dataset into ChromaDB.
-    
+
     Returns statistics dict.
     """
     chunks_path = dataset.chunks_path
@@ -371,7 +392,7 @@ def _index_dataset(
     }
 
     seen_ids: set[str] = set()
-    
+
     batch_ids: List[str] = []
     batch_docs: List[str] = []
     batch_metas: List[Dict[str, Any]] = []
@@ -455,11 +476,11 @@ def index_all(
 ) -> List[Dict[str, Any]]:
     """
     Index one or more datasets.
-    
+
     Args:
         target: "mitre", "d3fend", or "all"
         drop_existing: If True, delete existing collection before indexing
-    
+
     Returns:
         List of statistics dicts, one per dataset.
     """
@@ -471,7 +492,7 @@ def index_all(
     client = chromadb.PersistentClient(path=str(CHROMA_DB_DIR))
 
     print(f"[index] Target={target!r} -> datasets={[d.key for d in datasets]} | drop_existing={drop_existing}")
-    
+
     all_stats = []
     for ds in datasets:
         stats = _index_dataset(
@@ -488,7 +509,7 @@ def index_all(
 def main() -> None:
     """CLI entry point."""
     import argparse
-    
+
     parser = argparse.ArgumentParser(description="Index MITRE/D3FEND chunks into ChromaDB")
     parser.add_argument(
         "--target", "-t",
@@ -501,13 +522,13 @@ def main() -> None:
         action="store_true",
         help="Don't drop existing collection (append mode)",
     )
-    
+
     args = parser.parse_args()
-    
+
     drop_existing = not args.no_drop
     if os.getenv("MITRE_REINDEX_DROP") is not None:
         drop_existing = _parse_bool_env("MITRE_REINDEX_DROP", default=True)
-    
+
     index_all(target=args.target, drop_existing=drop_existing)
 
 
