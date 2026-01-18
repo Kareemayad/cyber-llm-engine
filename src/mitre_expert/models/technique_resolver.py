@@ -1,3 +1,4 @@
+#src/mitre_expert/models/technique_resolver.py
 """
 Deterministic technique resolver for MITRE ATT&CK.
 
