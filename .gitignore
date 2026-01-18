@@ -1,2 +1,4 @@
 src/mitre_expert/models/llama3.1-8b-instruct/
 data/
+__pycache__/
+*.pyc
