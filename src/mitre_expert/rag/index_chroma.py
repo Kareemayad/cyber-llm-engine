@@ -1,96 +1,55 @@
-# src/mitre_expert/rag/index_chroma.py
 """
 Index RAG chunks into ChromaDB with pluggable embedding backends.
 
-Supports multiple datasets:
-- MITRE ATT&CK chunks (mitre_chunks_v1.jsonl) -> collection "mitre_chunks_v1"
-- MITRE D3FEND chunks (d3fend_chunks_v1.jsonl) -> collection "d3fend_chunks_v1"
+Supports:
+- MITRE ATT&CK chunks (mitre_chunks_v1)
+- D3FEND defense chunks (d3fend_chunks_v1)
 
-Control via env:
-  MITRE_INDEX_TARGET = "mitre" (default) | "d3fend" | "all"
-  MITRE_REINDEX_DROP = "true" (default) | "false"
+Embedding backends:
+- HuggingFace sentence-transformers (default)
+- Ollama (local LLM server)
 
-Embedding backends (select via env):
-  MITRE_EMBED_BACKEND:
-    - "hf"      -> HuggingFace sentence-transformers (default)
-    - "ollama"  -> Ollama local embeddings
-
-  For HF:
-    MITRE_HF_EMBED_MODEL (default: "sentence-transformers/all-MiniLM-L6-v2")
-
-  For Ollama:
-    MITRE_OLLAMA_EMBED_MODEL (default: "nomic-embed-text")
-    OLLAMA_BASE_URL (default: "http://localhost:11434")
-
-Chroma persistent DB:
-  data/embeddings/mitre/chroma/
+FIXES:
+- Issue 1: Now captures both analytic_id and analytic_stix_id
+- Issue 2: Now stores analytic-level telemetry fields for proper ranking
+- Issue 3: Now captures D3FEND primary_attack_technique for per-technique retrieval
 """
 
 from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List
 
 import chromadb
 import requests
 from chromadb.utils import embedding_functions
 
-# ---------------------------------------------------------------------------
-# Paths & constants
-# ---------------------------------------------------------------------------
-
-REPO_ROOT = Path(__file__).resolve().parents[3]
-DB_DIR = REPO_ROOT / "data/embeddings/mitre/chroma"
-BATCH_SIZE = 64  # how many chunks per Chroma .add call
-
-
-@dataclass(frozen=True)
-class DatasetConfig:
-    key: str
-    chunks_path: Path
-    collection_name: str
-
-
-DATASETS: List[DatasetConfig] = [
-    DatasetConfig(
-        key="mitre",
-        chunks_path=REPO_ROOT / "data/processed/mitre/mitre_chunks_v1.jsonl",
-        collection_name="mitre_chunks_v1",
-    ),
-    DatasetConfig(
-        key="d3fend",
-        chunks_path=REPO_ROOT / "data/processed/mitre/d3fend_chunks_v1.jsonl",
-        collection_name="d3fend_chunks_v1",
-    ),
-]
+from mitre_expert.config import (
+    CHROMA_DB_DIR,
+    DATASETS,
+    DatasetConfig,
+    INDEX_BATCH_SIZE,
+    EMBED_BACKEND,
+    HF_EMBED_MODEL,
+    OLLAMA_EMBED_MODEL,
+    OLLAMA_BASE_URL,
+    get_dataset_config,
+    get_all_dataset_keys,
+)
 
 
 # ---------------------------------------------------------------------------
 # Embedding backends
 # ---------------------------------------------------------------------------
 
-
 class OllamaEmbeddingFunction(embedding_functions.EmbeddingFunction):
-    """
-    Embedding function that calls Ollama locally.
-
-    Preferred endpoint:
-      POST /api/embed   payload: {"model": "...", "input": "text" | ["t1","t2"] }
-      response: {"embeddings": [[...], [...]]}
-
-    Fallback endpoint:
-      POST /api/embeddings  payload: {"model": "...", "prompt": "text"}
-      response: {"embedding": [...]}
-    """
+    """Embedding function that calls Ollama locally."""
 
     def __init__(self, model: str = "nomic-embed-text", base_url: str | None = None) -> None:
         self.model = model
-        self.base_url = (base_url or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")).rstrip(
-            "/"
-        )
+        self.base_url = (base_url or OLLAMA_BASE_URL).rstrip("/")
         self._session = requests.Session()
 
     def _post_json(self, path: str, payload: Dict[str, Any]) -> requests.Response:
@@ -101,7 +60,7 @@ class OllamaEmbeddingFunction(embedding_functions.EmbeddingFunction):
         if not isinstance(input, list):
             raise TypeError("OllamaEmbeddingFunction expects a list[str] as input")
 
-        # ---- 1) Try /api/embed (supports batch)
+        # Try batch endpoint first
         try:
             resp = self._post_json("/api/embed", {"model": self.model, "input": input})
             if resp.status_code == 404:
@@ -111,10 +70,8 @@ class OllamaEmbeddingFunction(embedding_functions.EmbeddingFunction):
             data = resp.json()
             if "embeddings" in data and isinstance(data["embeddings"], list):
                 return data["embeddings"]
-
             if "embedding" in data and isinstance(data["embedding"], list):
                 return [data["embedding"]]
-
             raise ValueError(f"Unexpected /api/embed response keys={list(data.keys())}")
 
         except (FileNotFoundError, requests.HTTPError, ValueError) as embed_err:
@@ -126,7 +83,7 @@ class OllamaEmbeddingFunction(embedding_functions.EmbeddingFunction):
                         f"Ollama /api/embed failed: status={status}, body={body}"
                     ) from embed_err
 
-        # ---- 2) Fallback: /api/embeddings (single prompt per request)
+        # Fallback: one-by-one
         embeddings: List[List[float]] = []
         for text in input:
             resp = self._post_json("/api/embeddings", {"model": self.model, "prompt": text})
@@ -141,11 +98,9 @@ class OllamaEmbeddingFunction(embedding_functions.EmbeddingFunction):
             if "embedding" in data and isinstance(data["embedding"], list):
                 embeddings.append(data["embedding"])
                 continue
-
             if "embeddings" in data and isinstance(data["embeddings"], list) and data["embeddings"]:
                 embeddings.append(data["embeddings"][0])
                 continue
-
             raise ValueError(f"Unexpected /api/embeddings response keys={list(data.keys())}")
 
         return embeddings
@@ -156,10 +111,12 @@ class HFSentenceTransformerEmbedding(embedding_functions.EmbeddingFunction):
 
     def __init__(self, model_name: str) -> None:
         from sentence_transformers import SentenceTransformer
+        import torch
 
         self.model_name = model_name
-        print(f"[index] Loading sentence-transformers model: {model_name}")
-        self.model = SentenceTransformer(model_name)
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
+        print(f"[index] Loading sentence-transformers model: {model_name} on {device}")
+        self.model = SentenceTransformer(model_name, device=device)
 
     def __call__(self, input: List[str]) -> List[List[float]]:
         embeddings = self.model.encode(
@@ -171,28 +128,24 @@ class HFSentenceTransformerEmbedding(embedding_functions.EmbeddingFunction):
         return embeddings.tolist()
 
 
-def get_embedding_function():
-    """Decide which embedding backend to use based on env variables."""
-    backend = os.getenv("MITRE_EMBED_BACKEND", "hf").lower()
+def get_embedding_function() -> embedding_functions.EmbeddingFunction:
+    """Get embedding function based on environment configuration."""
+    backend = EMBED_BACKEND
 
     if backend == "hf":
-        model_name = os.getenv("MITRE_HF_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-        print(f"[index] Using HuggingFace sentence-transformers backend: {model_name}")
-        return HFSentenceTransformerEmbedding(model_name)
+        print(f"[index] Using HuggingFace sentence-transformers backend: {HF_EMBED_MODEL}")
+        return HFSentenceTransformerEmbedding(HF_EMBED_MODEL)
 
     if backend == "ollama":
-        model_name = os.getenv("MITRE_OLLAMA_EMBED_MODEL", "nomic-embed-text")
-        base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        print(f"[index] Using Ollama backend: model={model_name} base_url={base_url}")
-        return OllamaEmbeddingFunction(model=model_name, base_url=base_url)
+        print(f"[index] Using Ollama backend: model={OLLAMA_EMBED_MODEL} base_url={OLLAMA_BASE_URL}")
+        return OllamaEmbeddingFunction(model=OLLAMA_EMBED_MODEL, base_url=OLLAMA_BASE_URL)
 
-    raise ValueError(f"Unknown MITRE_EMBED_BACKEND={backend!r}. Expected 'hf' or 'ollama'.")
+    raise ValueError(f"Unknown EMBED_BACKEND={backend!r}. Expected 'hf' or 'ollama'.")
 
 
 # ---------------------------------------------------------------------------
-# Helpers for loading chunks & sanitizing metadata
+# Chunk loading
 # ---------------------------------------------------------------------------
-
 
 def _load_chunks(path: Path) -> Iterable[Dict[str, Any]]:
     """Stream chunk records from JSONL."""
@@ -208,112 +161,147 @@ def _load_chunks(path: Path) -> Iterable[Dict[str, Any]]:
             yield json.loads(line)
 
 
+# ---------------------------------------------------------------------------
+# Metadata handling
+# ---------------------------------------------------------------------------
+
 def _sanitize_metadata(meta: Dict[str, Any]) -> Dict[str, Any]:
     """
     Ensure Chroma-compatible metadata types.
-
-    IMPORTANT: Chroma rejects None values. So:
-      - Any key with value None is DROPPED.
-      - Lists/sets/tuples are joined into a comma-separated string,
-        and None elements are dropped.
-      - Empty lists become DROPPED.
-      - Other objects become str(value).
-
-    Output values are only: str | int | float | bool
+    
+    Chroma only supports: str, int, float, bool
+    Lists/sets/tuples are joined into comma-separated strings.
+    Dicts and complex objects are dropped (not queryable anyway).
     """
     safe: Dict[str, Any] = {}
+    
     for k, v in meta.items():
         if v is None:
             continue
 
+        # Primitive types: pass through
         if isinstance(v, (str, int, float, bool)):
             safe[k] = v
             continue
 
+        # Lists/tuples/sets: join as comma-separated string
         if isinstance(v, (list, tuple, set)):
-            items = [str(x) for x in v if x is not None]
-            if not items:
-                continue
-            safe[k] = ", ".join(items)
+            # Filter out None and empty strings
+            items = [str(x).strip() for x in v if x is not None and str(x).strip()]
+            if items:
+                safe[k] = ", ".join(items)
             continue
 
-        safe[k] = str(v)
+        # Dicts: skip (too complex for Chroma metadata)
+        if isinstance(v, dict):
+            # Could stringify, but not useful for queries
+            continue
+
+        # Fallback: stringify
+        str_val = str(v).strip()
+        if str_val:
+            safe[k] = str_val
 
     return safe
 
 
 def _build_metadata_from_record(rec: Dict[str, Any], dataset_key: str) -> Dict[str, Any]:
     """
-    Build a metadata dict that works for BOTH MITRE and D3FEND chunk records.
-
-    MITRE fields we expect:
-      technique_id, technique_name, section, tactic_ids, tactic_names, platforms,
-      data_component_ids, log_source_names, mitigation_id, analytic_id, etc.
-
-    D3FEND fields we expect (from build_d3fend_chunks.py outputs):
-      d3fend_id, label/name, section, attack_ids / attack_technique_ids, relations, etc.
-
-    We store all "common" keys AND a few dataset-specific keys if present.
+    Build metadata dict for BOTH MITRE and D3FEND chunks.
+    
+    FIX Issue 1: Now captures both analytic_stix_id AND analytic_id
+    FIX Issue 2: Now captures analytic-level telemetry fields
+    FIX Issue 3: Now captures D3FEND primary_attack_technique
     """
     section = rec.get("section") or "unknown"
-
-    # Common identifiers
     chunk_id = rec.get("chunk_id") or rec.get("id")
-    source = rec.get("source") or (f"{dataset_key}_chunks_v1")
+    source = rec.get("source") or f"{dataset_key}_chunks_v1"
 
     meta_raw: Dict[str, Any] = {
         "chunk_id": chunk_id,
         "source": source,
         "dataset": dataset_key,
         "section": section,
+        # Legacy aliases for backward compatibility
         "chunk_type": section,
         "type": section,
     }
 
-    # --- MITRE technique-centric metadata (if present)
-    for k in [
+    # --- MITRE technique-centric metadata ---
+    mitre_fields = [
+        # Core identifiers
         "technique_id",
         "technique_name",
         "tactic_ids",
         "tactic_names",
         "platforms",
+        
+        # Technique-level telemetry
         "data_component_ids",
         "log_source_names",
+        
+        # Mitigation metadata
         "mitigation_id",
         "mitigation_name",
-        "analytic_id",
-        "analytic_name",
+        
+        # Procedure metadata
         "procedure_source_id",
         "procedure_source_name",
         "procedure_source_type",
-    ]:
-        if k in rec:
-            meta_raw[k] = rec.get(k)
+        
+        # Detection strategy metadata
+        "detection_strategy_stix_id",
+        "detection_strategy_name",
+        
+        # Analytic metadata (FIX Issue 1)
+        "analytic_stix_id",
+        "analytic_name",
+        
+        # Analytic-level telemetry (FIX Issue 2)
+        "analytic_data_component_ids",
+        "analytic_log_source_names",
+        # NOTE: analytic_log_source_references is List[Dict], not indexable
+    ]
+    
+    for k in mitre_fields:
+        if k in rec and rec[k] is not None:
+            meta_raw[k] = rec[k]
+    
+    # FIX Issue 1: Set analytic_id as alias for analytic_stix_id
+    if "analytic_stix_id" in rec and rec["analytic_stix_id"]:
+        meta_raw["analytic_id"] = rec["analytic_stix_id"]
+    elif "analytic_id" in rec and rec["analytic_id"]:
+        meta_raw["analytic_id"] = rec["analytic_id"]
 
-    # --- D3FEND defense-centric metadata (if present)
-    # (your normalized + chunk scripts may use slightly different field names; we capture common variants)
-    for k in [
+    # --- D3FEND defense-centric metadata ---
+    d3fend_fields = [
+        # Core identifiers
         "d3fend_id",
-        "d3fend_uri",
         "label",
-        "name",
-        "definition",
-        "attack_id",  # sometimes a single
-        "attack_ids",  # sometimes a list
-        "attack_technique_ids",
+        "uri",
+        
+        # ATT&CK technique mappings
         "attack_techniques",
-        "related_uris",
-        "related_ids",
-        "related_labels",
+        "primary_attack_technique",  # FIX Issue 3: Per-technique mapping
+        
+        # Relations
         "relation_types",
-    ]:
-        if k in rec:
-            meta_raw[k] = rec.get(k)
+        "related_uris",
+    ]
+    
+    for k in d3fend_fields:
+        if k in rec and rec[k] is not None:
+            meta_raw[k] = rec[k]
 
     return _sanitize_metadata(meta_raw)
 
 
+# ---------------------------------------------------------------------------
+# Environment helpers
+# ---------------------------------------------------------------------------
+
 def _parse_bool_env(name: str, default: bool) -> bool:
+    """Parse boolean from environment variable."""
     raw = os.getenv(name)
     if raw is None:
         return default
@@ -321,27 +309,36 @@ def _parse_bool_env(name: str, default: bool) -> bool:
 
 
 def _select_datasets(target: str) -> List[DatasetConfig]:
+    """Select datasets to index based on target string."""
     t = (target or "mitre").strip().lower()
     if t == "all":
         return DATASETS
-    chosen = [d for d in DATASETS if d.key == t]
-    if not chosen:
-        valid = ", ".join(d.key for d in DATASETS) + ", all"
-        raise ValueError(f"Unknown MITRE_INDEX_TARGET={target!r}. Valid: {valid}")
-    return chosen
+    
+    # Try to find by key
+    config = get_dataset_config(t)
+    if config:
+        return [config]
+    
+    # Not found
+    valid = ", ".join(get_all_dataset_keys()) + ", all"
+    raise ValueError(f"Unknown target={target!r}. Valid: {valid}")
 
 
 # ---------------------------------------------------------------------------
 # Index one dataset
 # ---------------------------------------------------------------------------
 
-
 def _index_dataset(
     client: chromadb.PersistentClient,
     dataset: DatasetConfig,
     embed_fn: embedding_functions.EmbeddingFunction,
     drop_existing: bool,
-) -> None:
+) -> Dict[str, Any]:
+    """
+    Index a single dataset into ChromaDB.
+    
+    Returns statistics dict.
+    """
     chunks_path = dataset.chunks_path
     collection_name = dataset.collection_name
 
@@ -349,6 +346,7 @@ def _index_dataset(
     print(f"[index] Input: {chunks_path}")
     print(f"[index] Collection: {collection_name}")
 
+    # Drop existing if requested
     if drop_existing:
         try:
             print(f"[index] Deleting existing collection '{collection_name}' ...")
@@ -362,89 +360,155 @@ def _index_dataset(
         metadata={"hnsw:space": "cosine"},
     )
 
-    seen_ids: set[str] = set()
-    dup_count = 0
-    skipped_empty_text = 0
-    empty_meta_fixed = 0
-    total = 0
+    # Track statistics
+    stats = {
+        "dataset": dataset.key,
+        "total_indexed": 0,
+        "duplicates_renamed": 0,
+        "skipped_empty_text": 0,
+        "empty_meta_fixed": 0,
+        "sections": {},
+    }
 
+    seen_ids: set[str] = set()
+    
     batch_ids: List[str] = []
     batch_docs: List[str] = []
     batch_metas: List[Dict[str, Any]] = []
 
     for idx, rec in enumerate(_load_chunks(chunks_path)):
+        # Generate unique chunk ID
         base_id = str(rec.get("id") or rec.get("chunk_id") or f"{dataset.key}_chunk_{idx}")
 
         chunk_id = base_id
         if chunk_id in seen_ids:
-            dup_count += 1
+            stats["duplicates_renamed"] += 1
             suffix = 1
             new_id = f"{base_id}::dup::{suffix}"
             while new_id in seen_ids:
                 suffix += 1
                 new_id = f"{base_id}::dup::{suffix}"
             chunk_id = new_id
-            if dup_count <= 10:
-                print(f"[warn] Duplicate chunk id '{base_id}' found. Renamed to '{chunk_id}'.")
+            if stats["duplicates_renamed"] <= 10:
+                print(f"[warn] Duplicate chunk id '{base_id}' renamed to '{chunk_id}'.")
 
         seen_ids.add(chunk_id)
 
+        # Validate text
         text = rec.get("text")
         if not text or not isinstance(text, str) or not text.strip():
-            skipped_empty_text += 1
+            stats["skipped_empty_text"] += 1
             continue
 
+        # Build metadata
         meta_safe = _build_metadata_from_record(rec, dataset_key=dataset.key)
 
-        # Chroma requires non-empty metadata dicts.
         if not meta_safe:
-            empty_meta_fixed += 1
-            meta_safe = {"source": f"{dataset.key}_chunks_v1", "dataset": dataset.key, "section": "unknown"}
+            stats["empty_meta_fixed"] += 1
+            meta_safe = {
+                "source": f"{dataset.key}_chunks_v1",
+                "dataset": dataset.key,
+                "section": "unknown",
+            }
 
+        # Track section distribution
+        section = meta_safe.get("section", "unknown")
+        stats["sections"][section] = stats["sections"].get(section, 0) + 1
+
+        # Add to batch
         batch_ids.append(chunk_id)
         batch_docs.append(text)
         batch_metas.append(meta_safe)
-        total += 1
+        stats["total_indexed"] += 1
 
-        if len(batch_ids) >= BATCH_SIZE:
+        # Flush batch
+        if len(batch_ids) >= INDEX_BATCH_SIZE:
             collection.add(ids=batch_ids, documents=batch_docs, metadatas=batch_metas)
-            print(f"[index] Inserted {total} chunks ...")
+            print(f"[index] Inserted {stats['total_indexed']} chunks ...")
             batch_ids, batch_docs, batch_metas = [], [], []
 
+    # Final batch
     if batch_ids:
         collection.add(ids=batch_ids, documents=batch_docs, metadatas=batch_metas)
-        print(f"[index] Inserted {total} chunks (final batch).")
+        print(f"[index] Inserted {stats['total_indexed']} chunks (final batch).")
 
-    print(f"[index] DONE dataset={dataset.key} | indexed={total} | deduped_ids={dup_count}")
-    if skipped_empty_text:
-        print(f"[index] Skipped {skipped_empty_text} chunks with empty text.")
-    if empty_meta_fixed:
-        print(f"[index] Fixed {empty_meta_fixed} chunks that had empty metadata.")
+    # Summary
+    print(f"\n[index] DONE dataset={dataset.key}")
+    print(f"  Indexed: {stats['total_indexed']}")
+    print(f"  Duplicates renamed: {stats['duplicates_renamed']}")
+    if stats["skipped_empty_text"]:
+        print(f"  Skipped (empty text): {stats['skipped_empty_text']}")
+    if stats["empty_meta_fixed"]:
+        print(f"  Fixed (empty metadata): {stats['empty_meta_fixed']}")
+    print(f"  Sections: {stats['sections']}")
+
+    return stats
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-
-def main() -> None:
-    target = os.getenv("MITRE_INDEX_TARGET", "mitre")
-    drop_existing = _parse_bool_env("MITRE_REINDEX_DROP", default=True)
-
+def index_all(
+    target: str = "mitre",
+    drop_existing: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    Index one or more datasets.
+    
+    Args:
+        target: "mitre", "d3fend", or "all"
+        drop_existing: If True, delete existing collection before indexing
+    
+    Returns:
+        List of statistics dicts, one per dataset.
+    """
     datasets = _select_datasets(target)
-
-    # 1) Prepare embedding function
     embed_fn = get_embedding_function()
 
-    # 2) Connect to Chroma
-    print(f"[index] Connecting to Chroma at {DB_DIR} ...")
-    DB_DIR.mkdir(parents=True, exist_ok=True)
-    client = chromadb.PersistentClient(path=str(DB_DIR))
+    print(f"[index] Connecting to Chroma at {CHROMA_DB_DIR} ...")
+    CHROMA_DB_DIR.mkdir(parents=True, exist_ok=True)
+    client = chromadb.PersistentClient(path=str(CHROMA_DB_DIR))
 
-    # 3) Index selected dataset(s)
     print(f"[index] Target={target!r} -> datasets={[d.key for d in datasets]} | drop_existing={drop_existing}")
+    
+    all_stats = []
     for ds in datasets:
-        _index_dataset(client=client, dataset=ds, embed_fn=embed_fn, drop_existing=drop_existing)
+        stats = _index_dataset(
+            client=client,
+            dataset=ds,
+            embed_fn=embed_fn,
+            drop_existing=drop_existing,
+        )
+        all_stats.append(stats)
+
+    return all_stats
+
+
+def main() -> None:
+    """CLI entry point."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Index MITRE/D3FEND chunks into ChromaDB")
+    parser.add_argument(
+        "--target", "-t",
+        default=os.getenv("MITRE_INDEX_TARGET", "mitre"),
+        choices=get_all_dataset_keys() + ["all"],
+        help="Dataset(s) to index",
+    )
+    parser.add_argument(
+        "--no-drop",
+        action="store_true",
+        help="Don't drop existing collection (append mode)",
+    )
+    
+    args = parser.parse_args()
+    
+    drop_existing = not args.no_drop
+    if os.getenv("MITRE_REINDEX_DROP") is not None:
+        drop_existing = _parse_bool_env("MITRE_REINDEX_DROP", default=True)
+    
+    index_all(target=args.target, drop_existing=drop_existing)
 
 
 if __name__ == "__main__":

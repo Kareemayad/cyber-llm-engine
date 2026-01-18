@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#scripts/run_mitre_docqa_api.sh
 set -euo pipefail
 
 export MITRE_DOCQA_MODEL_PATH="${MITRE_DOCQA_MODEL_PATH:-src/mitre_expert/models/llama3.1-8b-instruct}"

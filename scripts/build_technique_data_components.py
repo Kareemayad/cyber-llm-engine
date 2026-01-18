@@ -1,3 +1,4 @@
+#scripts/build_technique_data_components.py
 import pandas as pd
 from stix2 import MemoryStore, Filter
 
