@@ -132,6 +132,53 @@ def _question_mentions_any_tech_id(q: str) -> bool:
     return bool(TECHID_RE.search(q or ""))
 
 
+def _is_explanation_question(q: str) -> bool:
+    """
+    Detect if the question is asking to explain/describe a technique.
+    
+    Examples:
+    - "What is T1059?"
+    - "Explain T1059"
+    - "Tell me about T1059"
+    - "Describe Command and Scripting Interpreter"
+    """
+    ql = (q or "").strip().lower()
+    if not ql:
+        return False
+    
+    # Strong indicators of explanation questions
+    explanation_patterns = [
+        "what is ",
+        "what's ",
+        "explain ",
+        "describe ",
+        "tell me about ",
+        "overview of ",
+        "summary of ",
+        "what does ",
+        "how does ",
+        "what are the ",  # "what are the sub-techniques"
+    ]
+    
+    for pattern in explanation_patterns:
+        if ql.startswith(pattern) or f" {pattern}" in ql:
+            return True
+    
+    # If question mentions a technique ID and doesn't have detection/mitigation keywords
+    if _question_mentions_any_tech_id(q):
+        detection_keywords = ["detect", "detection", "hunt", "rule", "sigma", "log", "telemetry"]
+        mitigation_keywords = ["mitigat", "prevent", "countermeasure", "remediat", "defense"]
+        
+        has_detection = any(kw in ql for kw in detection_keywords)
+        has_mitigation = any(kw in ql for kw in mitigation_keywords)
+        
+        # Simple questions like "T1059?" or "What is T1059?" without other keywords
+        if not has_detection and not has_mitigation:
+            return True
+    
+    return False
+
+
 def _is_mitigation_enumeration_question(q: str) -> bool:
     """
     True if the user is asking to list / enumerate mitigations.
@@ -214,19 +261,27 @@ def build_mitre_context(question: str, topk: int = 8) -> str:
     """
     Build a context block for the MITRE-DocQA model.
 
+    IMPROVED: For explanation questions ("What is T1059?"), always fetch:
+      1. The description chunk (deterministically)
+      2. Procedure examples (if available)
+      3. Then fill remaining slots with semantic search
+    
     For mitigation enumeration questions:
       - resolve technique_id
       - fetch 1 description chunk deterministically
       - fetch ALL mitigation chunks deterministically (subject to hard cap)
     """
     want_mitigations_enum = _is_mitigation_enumeration_question(question)
+    want_explanation = _is_explanation_question(question)
 
     best = resolve_best_technique(question, max_results=3)
     technique_id = best.id.upper() if best and best.id else None
 
     lines: List[str] = []
 
-    # Enumeration mode (only when truly listing mitigations)
+    # =========================================================================
+    # Mode 1: Mitigation enumeration (existing logic)
+    # =========================================================================
     if want_mitigations_enum and technique_id:
         lines.append(f"Detected techniques: {technique_id}")
         lines.append("")
@@ -287,6 +342,86 @@ def build_mitre_context(question: str, topk: int = 8) -> str:
             lines.append(doc)
             lines.append("")
 
+        return "\n".join(lines)
+
+    # =========================================================================
+    # Mode 2: Explanation question - prioritize description + procedure_example
+    # =========================================================================
+    if want_explanation and technique_id:
+        lines.append(f"Detected techniques: {technique_id}")
+        lines.append("")
+        
+        used_chunk_ids: set = set()
+        chunks_added = 0
+        
+        # 2a. Always fetch description first
+        desc = get_mitre_chunks_by_filter(
+            where={"technique_id": technique_id, "section": "description"},
+            limit=1,
+        )
+        desc_docs = desc.get("documents", [[]])[0]
+        desc_metas = desc.get("metadatas", [[]])[0]
+        desc_ids = desc.get("ids", [[]])[0]
+        
+        if desc_docs and desc_metas:
+            ddoc = desc_docs[0]
+            dmeta = desc_metas[0]
+            did = desc_ids[0] if desc_ids else ""
+            tname = dmeta.get("technique_name", "")
+            header = f"[{technique_id} {('- ' + tname) if tname else ''} | description]"
+            lines.append(header)
+            lines.append(ddoc)
+            lines.append("")
+            used_chunk_ids.add(did)
+            chunks_added += 1
+        
+        # 2b. Fetch procedure examples (real-world usage)
+        proc = get_mitre_chunks_by_filter(
+            where={"technique_id": technique_id, "section": "procedure_example"},
+            limit=3,
+        )
+        proc_docs = proc.get("documents", [[]])[0]
+        proc_metas = proc.get("metadatas", [[]])[0]
+        proc_ids = proc.get("ids", [[]])[0]
+        
+        for pid, pdoc, pmeta in zip(proc_ids, proc_docs, proc_metas):
+            if chunks_added >= topk:
+                break
+            if pid in used_chunk_ids:
+                continue
+            tname = pmeta.get("technique_name", "")
+            header = f"[{technique_id} {('- ' + tname) if tname else ''} | procedure_example]"
+            lines.append(header)
+            lines.append(pdoc)
+            lines.append("")
+            used_chunk_ids.add(pid)
+            chunks_added += 1
+        
+        # 2c. Fill remaining slots with semantic search (excluding already-used chunks)
+        remaining = topk - chunks_added
+        if remaining > 0:
+            result: Dict[str, Any] = auto_search_mitre_chunks(query=question, k=remaining + 5)
+            sem_docs = result.get("documents", [[]])[0]
+            sem_metas = result.get("metadatas", [[]])[0]
+            sem_ids = result.get("ids", [[]])[0]
+            
+            for sid, sdoc, smeta in zip(sem_ids, sem_docs, sem_metas):
+                if chunks_added >= topk:
+                    break
+                if sid in used_chunk_ids:
+                    continue
+                
+                tid = smeta.get("technique_id", "unknown")
+                tname = smeta.get("technique_name", "")
+                section = smeta.get("section", smeta.get("chunk_type", smeta.get("type", "unknown")))
+                
+                header = f"[{tid} {('- ' + tname) if tname else ''} | {section}]"
+                lines.append(header)
+                lines.append(sdoc)
+                lines.append("")
+                used_chunk_ids.add(sid)
+                chunks_added += 1
+        
         return "\n".join(lines)
 
     # Default mode (semantic top-k)
