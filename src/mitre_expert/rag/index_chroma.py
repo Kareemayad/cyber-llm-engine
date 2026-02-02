@@ -7,7 +7,8 @@ Supports:
 - D3FEND defense chunks (d3fend_chunks_v1)
 
 Embedding backends:
-- HuggingFace sentence-transformers (default)
+- LM Studio (default) - using gte-Qwen2-7B-instruct or similar
+- HuggingFace sentence-transformers
 - Ollama (local LLM server)
 
 FIXES:
@@ -37,6 +38,8 @@ from mitre_expert.config import (
     HF_EMBED_MODEL,
     OLLAMA_EMBED_MODEL,
     OLLAMA_BASE_URL,
+    LMSTUDIO_BASE_URL,
+    LMSTUDIO_EMBED_MODEL,
     get_dataset_config,
     get_all_dataset_keys,
 )
@@ -45,6 +48,66 @@ from mitre_expert.config import (
 # ---------------------------------------------------------------------------
 # Embedding backends
 # ---------------------------------------------------------------------------
+
+class LMStudioEmbeddingFunction(embedding_functions.EmbeddingFunction):
+    """
+    Embedding function using LM Studio's OpenAI-compatible API.
+    
+    LM Studio can serve embedding models like:
+    - gte-Qwen2-7B-instruct (default)
+    - nomic-embed-text-v1.5
+    - bge-large-en-v1.5
+    - e5-large-v2
+    """
+
+    def __init__(
+        self,
+        base_url: str = "http://localhost:1234/v1",
+        model: str = "gte-Qwen2-7B-instruct",
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self._embed_url = f"{self.base_url}/embeddings"
+        self._session = requests.Session()
+
+    def __call__(self, input: List[str]) -> List[List[float]]:
+        if not isinstance(input, list):
+            raise TypeError("LMStudioEmbeddingFunction expects a list[str] as input")
+
+        payload = {"input": input}
+        if self.model:
+            payload["model"] = self.model
+
+        try:
+            resp = self._session.post(
+                self._embed_url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=120,  # Increased timeout for larger batches
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            # OpenAI format: {"data": [{"embedding": [...], "index": 0}, ...]}
+            embeddings = []
+            for item in sorted(data.get("data", []), key=lambda x: x.get("index", 0)):
+                embeddings.append(item["embedding"])
+
+            return embeddings
+
+        except requests.exceptions.ConnectionError as e:
+            raise ConnectionError(
+                f"LM Studio embedding request failed: {e}\n"
+                f"Make sure LM Studio is running at {self.base_url} with an embedding model loaded.\n"
+                f"Expected model: {self.model}"
+            ) from e
+        except requests.exceptions.HTTPError as e:
+            raise RuntimeError(
+                f"LM Studio embedding HTTP error: status={resp.status_code}, body={resp.text[:500]}"
+            ) from e
+        except Exception as e:
+            raise RuntimeError(f"LM Studio embedding error: {e}") from e
+
 
 class OllamaEmbeddingFunction(embedding_functions.EmbeddingFunction):
     """Embedding function that calls Ollama locally."""
@@ -134,6 +197,10 @@ def get_embedding_function() -> embedding_functions.EmbeddingFunction:
     """Get embedding function based on environment configuration."""
     backend = EMBED_BACKEND
 
+    if backend == "lmstudio":
+        print(f"[index] Using LM Studio backend: url={LMSTUDIO_BASE_URL} model={LMSTUDIO_EMBED_MODEL}")
+        return LMStudioEmbeddingFunction(base_url=LMSTUDIO_BASE_URL, model=LMSTUDIO_EMBED_MODEL)
+
     if backend == "hf":
         print(f"[index] Using HuggingFace sentence-transformers backend: {HF_EMBED_MODEL}")
         return HFSentenceTransformerEmbedding(HF_EMBED_MODEL)
@@ -142,7 +209,7 @@ def get_embedding_function() -> embedding_functions.EmbeddingFunction:
         print(f"[index] Using Ollama backend: model={OLLAMA_EMBED_MODEL} base_url={OLLAMA_BASE_URL}")
         return OllamaEmbeddingFunction(model=OLLAMA_EMBED_MODEL, base_url=OLLAMA_BASE_URL)
 
-    raise ValueError(f"Unknown EMBED_BACKEND={backend!r}. Expected 'hf' or 'ollama'.")
+    raise ValueError(f"Unknown EMBED_BACKEND={backend!r}. Expected 'lmstudio', 'hf', or 'ollama'.")
 
 
 # ---------------------------------------------------------------------------

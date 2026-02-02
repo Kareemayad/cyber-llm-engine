@@ -16,7 +16,9 @@ Environment variable overrides:
     MITRE_REPO_ROOT          - Override repository root
     MITRE_DATA_DIR           - Override data directory
     MITRE_CHROMA_DIR         - Override ChromaDB directory
-    MITRE_EMBED_BACKEND      - Embedding backend: "hf" or "ollama"
+    MITRE_EMBED_BACKEND      - Embedding backend: "lmstudio" (default), "hf", or "ollama"
+    MITRE_LMSTUDIO_BASE_URL  - LM Studio server URL (default: http://localhost:1234/v1)
+    MITRE_LMSTUDIO_EMBED_MODEL - LM Studio model name (default: gte-Qwen2-7B-instruct)
     MITRE_HF_EMBED_MODEL     - HuggingFace model name
     MITRE_OLLAMA_EMBED_MODEL - Ollama model name
     OLLAMA_BASE_URL          - Ollama server URL
@@ -142,13 +144,19 @@ D3FEND_CHUNKS_PATH = DATA_PROCESSED_MITRE_DIR / "d3fend_chunks_v1.jsonl"
 # Embedding configuration
 # ---------------------------------------------------------------------------
 
-# Backend: "hf" (HuggingFace sentence-transformers) or "ollama"
-EMBED_BACKEND = os.getenv("MITRE_EMBED_BACKEND", "hf").lower()
+# Backend: "lmstudio" (default), "hf" (HuggingFace sentence-transformers), or "ollama"
+EMBED_BACKEND = os.getenv("MITRE_EMBED_BACKEND", "lmstudio").lower()
 
-# HuggingFace model
+# LM Studio configuration (default - using bge-large-en-v1.5)
+# Encoder-only models that work: text-embedding-bge-large-en-v1.5, text-embedding-nomic-embed-text-v1.5
+# LLM-based models (gte-Qwen2, e5-mistral) do NOT work with LM Studio's /v1/embeddings endpoint
+LMSTUDIO_BASE_URL = os.getenv("MITRE_LMSTUDIO_BASE_URL", "http://localhost:1234/v1")
+LMSTUDIO_EMBED_MODEL = os.getenv("MITRE_LMSTUDIO_EMBED_MODEL", "text-embedding-bge-large-en-v1.5")
+
+# HuggingFace model (fallback)
 HF_EMBED_MODEL = os.getenv("MITRE_HF_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 
-# Ollama configuration
+# Ollama configuration (fallback)
 OLLAMA_EMBED_MODEL = os.getenv("MITRE_OLLAMA_EMBED_MODEL", "nomic-embed-text")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
@@ -172,7 +180,7 @@ GET_HARD_CAP = int(os.getenv("MITRE_GET_HARD_CAP", "500"))
 # ---------------------------------------------------------------------------
 
 # Local LLM model (for answer generation)
-LOCAL_LLM_MODEL = os.getenv("MITRE_LOCAL_LLM_MODEL", "llama3.2:latest")
+LOCAL_LLM_MODEL = os.getenv("MITRE_LOCAL_LLM_MODEL", "llama3.1:latest")
 LOCAL_LLM_BASE_URL = os.getenv("MITRE_LOCAL_LLM_BASE_URL", OLLAMA_BASE_URL)
 
 # Temperature defaults
@@ -297,7 +305,10 @@ def print_config() -> None:
     
     print(f"\nEmbeddings:")
     print(f"  Backend: {EMBED_BACKEND}")
-    if EMBED_BACKEND == "hf":
+    if EMBED_BACKEND == "lmstudio":
+        print(f"  URL:     {LMSTUDIO_BASE_URL}")
+        print(f"  Model:   {LMSTUDIO_EMBED_MODEL}")
+    elif EMBED_BACKEND == "hf":
         print(f"  Model:   {HF_EMBED_MODEL}")
     else:
         print(f"  Model:   {OLLAMA_EMBED_MODEL}")

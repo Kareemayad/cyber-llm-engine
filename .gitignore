@@ -10,3 +10,4 @@ models/
 **/*.onnx_data
 **/*.pt
 **/.cache/
+.DS_Store
