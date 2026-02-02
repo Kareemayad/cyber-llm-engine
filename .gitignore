@@ -2,3 +2,11 @@ src/mitre_expert/models/llama3.1-8b-instruct/
 data/
 __pycache__/
 *.pyc
+# Local models / weights / caches
+models/
+**/*.bin
+**/*.safetensors
+**/*.onnx
+**/*.onnx_data
+**/*.pt
+**/.cache/
