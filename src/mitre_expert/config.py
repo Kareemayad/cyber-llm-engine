@@ -144,10 +144,23 @@ D3FEND_CHUNKS_PATH = DATA_PROCESSED_MITRE_DIR / "d3fend_chunks_v1.jsonl"
 # Embedding configuration
 # ---------------------------------------------------------------------------
 
-# Backend: "lmstudio" (default), "hf" (HuggingFace sentence-transformers), or "ollama"
-EMBED_BACKEND = os.getenv("MITRE_EMBED_BACKEND", "lmstudio").lower()
+# Backend: "bge-m3" (recommended), "lmstudio", "hf", or "ollama"
+EMBED_BACKEND = os.getenv("MITRE_EMBED_BACKEND", "bge-m3").lower()
 
-# LM Studio configuration (default - using bge-large-en-v1.5)
+# BGE-M3 configuration (recommended - local model)
+# State-of-the-art multilingual embedding model with dense, sparse, and colbert representations
+BGE_M3_MODEL_PATH = os.getenv(
+    "MITRE_BGE_M3_MODEL_PATH",
+    str(REPO_ROOT / "models" / "bge-m3")
+)
+
+# BGE Reranker v2 M3 (for high-quality reranking)
+BGE_RERANKER_MODEL_PATH = os.getenv(
+    "MITRE_BGE_RERANKER_MODEL_PATH",
+    str(REPO_ROOT / "models" / "bge-reranker-v2-m3")
+)
+
+# LM Studio configuration (alternative)
 # Encoder-only models that work: text-embedding-bge-large-en-v1.5, text-embedding-nomic-embed-text-v1.5
 # LLM-based models (gte-Qwen2, e5-mistral) do NOT work with LM Studio's /v1/embeddings endpoint
 LMSTUDIO_BASE_URL = os.getenv("MITRE_LMSTUDIO_BASE_URL", "http://localhost:1234/v1")
@@ -168,11 +181,34 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 # Default number of chunks to retrieve
 DEFAULT_TOPK = int(os.getenv("MITRE_DEFAULT_TOPK", "8"))
 
-# Prefetch multiplier for post-filtering
-PREFETCH_K = int(os.getenv("MITRE_PREFETCH_K", "50"))
+# Prefetch multiplier for post-filtering (increased for better reranking pool)
+PREFETCH_K = int(os.getenv("MITRE_PREFETCH_K", "100"))
 
 # Hard cap for deterministic .get() queries
 GET_HARD_CAP = int(os.getenv("MITRE_GET_HARD_CAP", "500"))
+
+# ---------------------------------------------------------------------------
+# Retrieval quality settings
+# ---------------------------------------------------------------------------
+
+# Minimum similarity threshold (filter low-quality results)
+MIN_SEMANTIC_SIMILARITY = float(os.getenv("MITRE_MIN_SEMANTIC_SIMILARITY", "0.60"))
+
+# Minimum reranker score threshold
+MIN_RERANK_SCORE = float(os.getenv("MITRE_MIN_RERANK_SCORE", "-5.0"))
+
+# Diversity settings
+MAX_RESULTS_PER_TECHNIQUE = int(os.getenv("MITRE_MAX_PER_TECHNIQUE", "2"))
+MAX_RESULTS_PER_SECTION = int(os.getenv("MITRE_MAX_PER_SECTION", "3"))
+
+# MMR lambda parameter (0=diversity, 1=relevance, 0.7=balanced toward relevance)
+MMR_LAMBDA = float(os.getenv("MITRE_MMR_LAMBDA", "0.7"))
+
+# Feature flags
+ENABLE_MMR = os.getenv("MITRE_ENABLE_MMR", "true").lower() == "true"
+ENABLE_DIVERSIFICATION = os.getenv("MITRE_ENABLE_DIVERSIFICATION", "true").lower() == "true"
+ENABLE_HYBRID_SEARCH = os.getenv("MITRE_HYBRID_ENABLED", "true").lower() == "true"
+ENABLE_RERANKING = os.getenv("MITRE_RERANK_ENABLED", "true").lower() == "true"
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +341,10 @@ def print_config() -> None:
     
     print(f"\nEmbeddings:")
     print(f"  Backend: {EMBED_BACKEND}")
-    if EMBED_BACKEND == "lmstudio":
+    if EMBED_BACKEND == "bge-m3":
+        print(f"  Model:     {BGE_M3_MODEL_PATH}")
+        print(f"  Reranker:  {BGE_RERANKER_MODEL_PATH}")
+    elif EMBED_BACKEND == "lmstudio":
         print(f"  URL:     {LMSTUDIO_BASE_URL}")
         print(f"  Model:   {LMSTUDIO_EMBED_MODEL}")
     elif EMBED_BACKEND == "hf":
@@ -327,6 +366,19 @@ def print_config() -> None:
     print(f"  Default top-k: {DEFAULT_TOPK}")
     print(f"  Prefetch k:    {PREFETCH_K}")
     print(f"  Get hard cap:  {GET_HARD_CAP}")
+
+    print(f"\nRetrieval Quality:")
+    print(f"  Min similarity:      {MIN_SEMANTIC_SIMILARITY}")
+    print(f"  Min rerank score:    {MIN_RERANK_SCORE}")
+    print(f"  Max per technique:   {MAX_RESULTS_PER_TECHNIQUE}")
+    print(f"  Max per section:     {MAX_RESULTS_PER_SECTION}")
+    print(f"  MMR lambda:          {MMR_LAMBDA}")
+
+    print(f"\nFeature Flags:")
+    print(f"  MMR:             {'✓' if ENABLE_MMR else '✗'}")
+    print(f"  Diversification: {'✓' if ENABLE_DIVERSIFICATION else '✗'}")
+    print(f"  Hybrid search:   {'✓' if ENABLE_HYBRID_SEARCH else '✗'}")
+    print(f"  Reranking:       {'✓' if ENABLE_RERANKING else '✗'}")
     
     print(f"\nPath Validation:")
     results = validate_paths()

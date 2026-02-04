@@ -7,7 +7,8 @@ Supports:
 - D3FEND defense chunks (d3fend_chunks_v1)
 
 Embedding backends:
-- LM Studio (default) - using gte-Qwen2-7B-instruct or similar
+- BGE-M3 (default) - state-of-the-art multilingual embeddings
+- LM Studio - using gte-Qwen2-7B-instruct or similar
 - HuggingFace sentence-transformers
 - Ollama (local LLM server)
 
@@ -40,6 +41,7 @@ from mitre_expert.config import (
     OLLAMA_BASE_URL,
     LMSTUDIO_BASE_URL,
     LMSTUDIO_EMBED_MODEL,
+    BGE_M3_MODEL_PATH,
     get_dataset_config,
     get_all_dataset_keys,
 )
@@ -193,9 +195,115 @@ class HFSentenceTransformerEmbedding(embedding_functions.EmbeddingFunction):
         return embeddings.tolist()
 
 
+class BGEM3EmbeddingFunction(embedding_functions.EmbeddingFunction):
+    """
+    Embedding function using BGE-M3 model.
+
+    BGE-M3 is a state-of-the-art multilingual embedding model that supports:
+    - Dense embeddings (1024 dimensions)
+    - Sparse embeddings (for lexical matching)
+    - ColBERT embeddings (for fine-grained matching)
+
+    We use dense embeddings for ChromaDB compatibility.
+    """
+
+    _instance = None
+    _model = None
+
+    def __new__(cls, model_path: str = None):
+        """Singleton pattern to avoid loading model multiple times."""
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self, model_path: str = None) -> None:
+        if BGEM3EmbeddingFunction._model is not None:
+            return
+
+        import torch
+
+        self.model_path = model_path or BGE_M3_MODEL_PATH
+
+        # Determine device
+        if torch.cuda.is_available():
+            self.device = "cuda"
+        elif torch.backends.mps.is_available():
+            self.device = "mps"
+        else:
+            self.device = "cpu"
+
+        print(f"[index] Loading BGE-M3 model from: {self.model_path} on {self.device}")
+
+        try:
+            from FlagEmbedding import BGEM3FlagModel
+
+            BGEM3EmbeddingFunction._model = BGEM3FlagModel(
+                self.model_path,
+                use_fp16=(self.device != "cpu"),
+                device=self.device,
+            )
+            print("[index] BGE-M3 model loaded successfully via FlagEmbedding")
+        except ImportError:
+            print("[index] FlagEmbedding not installed. Falling back to sentence-transformers.")
+            # Fallback to sentence-transformers if FlagEmbedding not available
+            from sentence_transformers import SentenceTransformer
+            BGEM3EmbeddingFunction._model = SentenceTransformer(
+                self.model_path,
+                device=self.device,
+            )
+            print("[index] BGE-M3 loaded via sentence-transformers")
+        except Exception as e:
+            print(f"[index] Error loading BGE-M3: {e}")
+            raise
+
+    def __call__(self, input: List[str]) -> List[List[float]]:
+        if not input:
+            return []
+
+        model = BGEM3EmbeddingFunction._model
+
+        try:
+            # Check if it's a FlagEmbedding model
+            if hasattr(model, 'encode'):
+                # FlagEmbedding BGEM3FlagModel
+                result = model.encode(
+                    input,
+                    batch_size=32,
+                    max_length=512,
+                    return_dense=True,
+                    return_sparse=False,
+                    return_colbert_vecs=False,
+                )
+                # Result is a dict with 'dense_vecs' key
+                if isinstance(result, dict):
+                    embeddings = result.get('dense_vecs', result)
+                else:
+                    embeddings = result
+
+                if hasattr(embeddings, 'tolist'):
+                    return embeddings.tolist()
+                return embeddings
+            else:
+                # sentence-transformers fallback
+                embeddings = model.encode(
+                    input,
+                    show_progress_bar=False,
+                    convert_to_numpy=True,
+                    normalize_embeddings=True,
+                )
+                return embeddings.tolist()
+        except Exception as e:
+            print(f"[index] BGE-M3 embedding failed: {e}")
+            raise
+
+
 def get_embedding_function() -> embedding_functions.EmbeddingFunction:
     """Get embedding function based on environment configuration."""
     backend = EMBED_BACKEND
+
+    if backend == "bge-m3":
+        print(f"[index] Using BGE-M3 backend: {BGE_M3_MODEL_PATH}")
+        return BGEM3EmbeddingFunction(model_path=BGE_M3_MODEL_PATH)
 
     if backend == "lmstudio":
         print(f"[index] Using LM Studio backend: url={LMSTUDIO_BASE_URL} model={LMSTUDIO_EMBED_MODEL}")
@@ -209,7 +317,7 @@ def get_embedding_function() -> embedding_functions.EmbeddingFunction:
         print(f"[index] Using Ollama backend: model={OLLAMA_EMBED_MODEL} base_url={OLLAMA_BASE_URL}")
         return OllamaEmbeddingFunction(model=OLLAMA_EMBED_MODEL, base_url=OLLAMA_BASE_URL)
 
-    raise ValueError(f"Unknown EMBED_BACKEND={backend!r}. Expected 'lmstudio', 'hf', or 'ollama'.")
+    raise ValueError(f"Unknown EMBED_BACKEND={backend!r}. Expected 'bge-m3', 'lmstudio', 'hf', or 'ollama'.")
 
 
 # ---------------------------------------------------------------------------
