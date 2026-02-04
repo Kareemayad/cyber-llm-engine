@@ -2,21 +2,25 @@
 Production-Grade Query Module for MITRE ATT&CK and D3FEND chunks.
 
 FEATURES:
-  1. Cross-encoder reranking for better precision
-  2. Hybrid search (BM25 + semantic) with RRF fusion
-  3. LM Studio embedding support (default)
-  4. Advanced query expansion for MITRE-specific terms
-  5. Tactic-aware query routing
-  6. Multi-strategy retrieval with fallback
-  7. Comprehensive error handling
-  8. Query intent classification
-  9. Result validation and quality scoring
+  1. BGE-M3 embeddings with dense, sparse, and colbert representations
+  2. BGE-Reranker-v2-M3 for high-quality cross-encoder reranking
+  3. Hybrid search (BM25 + semantic) with RRF fusion
+  4. MMR (Maximum Marginal Relevance) for diversity-aware retrieval
+  5. Section and technique diversification
+  6. Advanced query expansion for MITRE-specific terms
+  7. Tactic-aware query routing
+  8. Multi-strategy retrieval with fallback
+  9. Comprehensive error handling
+  10. Query intent classification
+  11. Result validation and quality scoring
 
 Configuration:
-  MITRE_EMBED_BACKEND     - "lmstudio" (default), "ollama", or "hf"
+  MITRE_EMBED_BACKEND     - "bge-m3" (default), "lmstudio", "ollama", or "hf"
   MITRE_RERANK_ENABLED    - "true" to enable reranking (default: true)
-  MITRE_HYBRID_ENABLED    - "true" to enable hybrid search (default: false)
+  MITRE_HYBRID_ENABLED    - "true" to enable hybrid search (default: true)
   MITRE_QUERY_EXPANSION   - "true" to enable query expansion (default: true)
+  MITRE_ENABLE_MMR        - "true" to enable MMR diversification (default: true)
+  MITRE_ENABLE_DIVERSIFICATION - "true" to enable section/technique diversification (default: true)
   MITRE_STRICT_MODE       - "true" for production strict validation (default: false)
 """
 
@@ -48,6 +52,17 @@ from mitre_expert.config import (
     OLLAMA_BASE_URL,
     LMSTUDIO_BASE_URL,
     LMSTUDIO_EMBED_MODEL,
+    BGE_M3_MODEL_PATH,
+    BGE_RERANKER_MODEL_PATH,
+    MIN_SEMANTIC_SIMILARITY,
+    MIN_RERANK_SCORE as CONFIG_MIN_RERANK_SCORE,
+    MAX_RESULTS_PER_TECHNIQUE,
+    MAX_RESULTS_PER_SECTION,
+    MMR_LAMBDA,
+    ENABLE_MMR,
+    ENABLE_DIVERSIFICATION,
+    ENABLE_HYBRID_SEARCH,
+    ENABLE_RERANKING,
 )
 
 # Conditional import for technique resolver
@@ -74,17 +89,18 @@ logger = logging.getLogger("mitre_expert.query")
 
 
 # ---------------------------------------------------------------------------
-# Feature Flags
+# Feature Flags (from config, with env override)
 # ---------------------------------------------------------------------------
 
-RERANK_ENABLED = os.getenv("MITRE_RERANK_ENABLED", "true").lower() == "true"
-HYBRID_ENABLED = os.getenv("MITRE_HYBRID_ENABLED", "false").lower() == "true"
+RERANK_ENABLED = ENABLE_RERANKING
+HYBRID_ENABLED = ENABLE_HYBRID_SEARCH
 QUERY_EXPANSION_ENABLED = os.getenv("MITRE_QUERY_EXPANSION", "true").lower() == "true"
 STRICT_MODE = os.getenv("MITRE_STRICT_MODE", "false").lower() == "true"
+MMR_ENABLED = ENABLE_MMR
+DIVERSIFICATION_ENABLED = ENABLE_DIVERSIFICATION
 
 # Minimum confidence thresholds for production
-MIN_RERANK_SCORE = float(os.getenv("MITRE_MIN_RERANK_SCORE", "-5.0"))
-MIN_SEMANTIC_SIMILARITY = float(os.getenv("MITRE_MIN_SEMANTIC_SIMILARITY", "0.3"))
+MIN_RERANK_SCORE = CONFIG_MIN_RERANK_SCORE
 
 
 # ---------------------------------------------------------------------------
@@ -581,7 +597,7 @@ class HFSentenceTransformerEmbedding(embedding_functions.EmbeddingFunction):
     def __call__(self, input: List[str]) -> List[List[float]]:
         if not input:
             return []
-        
+
         embeddings = self.model.encode(
             input,
             show_progress_bar=False,
@@ -591,9 +607,115 @@ class HFSentenceTransformerEmbedding(embedding_functions.EmbeddingFunction):
         return embeddings.tolist()
 
 
+class BGEM3EmbeddingFunction(embedding_functions.EmbeddingFunction):
+    """
+    Embedding function using BGE-M3 model.
+
+    BGE-M3 is a state-of-the-art multilingual embedding model that supports:
+    - Dense embeddings (1024 dimensions)
+    - Sparse embeddings (for lexical matching)
+    - ColBERT embeddings (for fine-grained matching)
+
+    We use dense embeddings for ChromaDB compatibility.
+    """
+
+    _instance = None
+    _model = None
+
+    def __new__(cls, model_path: str = None):
+        """Singleton pattern to avoid loading model multiple times."""
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self, model_path: str = None) -> None:
+        if BGEM3EmbeddingFunction._model is not None:
+            return
+
+        import torch
+
+        self.model_path = model_path or BGE_M3_MODEL_PATH
+
+        # Determine device
+        if torch.cuda.is_available():
+            self.device = "cuda"
+        elif torch.backends.mps.is_available():
+            self.device = "mps"
+        else:
+            self.device = "cpu"
+
+        logger.info(f"Loading BGE-M3 model from: {self.model_path} on {self.device}")
+
+        try:
+            from FlagEmbedding import BGEM3FlagModel
+
+            BGEM3EmbeddingFunction._model = BGEM3FlagModel(
+                self.model_path,
+                use_fp16=(self.device != "cpu"),
+                device=self.device,
+            )
+            logger.info("BGE-M3 model loaded successfully")
+        except ImportError:
+            logger.warning("FlagEmbedding not installed. Falling back to sentence-transformers.")
+            # Fallback to sentence-transformers if FlagEmbedding not available
+            from sentence_transformers import SentenceTransformer
+            BGEM3EmbeddingFunction._model = SentenceTransformer(
+                self.model_path,
+                device=self.device,
+            )
+            logger.info("BGE-M3 loaded via sentence-transformers")
+        except Exception as e:
+            logger.error(f"Failed to load BGE-M3: {e}")
+            raise
+
+    def __call__(self, input: List[str]) -> List[List[float]]:
+        if not input:
+            return []
+
+        model = BGEM3EmbeddingFunction._model
+
+        try:
+            # Check if it's a FlagEmbedding model
+            if hasattr(model, 'encode'):
+                # FlagEmbedding BGEM3FlagModel
+                result = model.encode(
+                    input,
+                    batch_size=32,
+                    max_length=512,
+                    return_dense=True,
+                    return_sparse=False,
+                    return_colbert_vecs=False,
+                )
+                # Result is a dict with 'dense_vecs' key
+                if isinstance(result, dict):
+                    embeddings = result.get('dense_vecs', result)
+                else:
+                    embeddings = result
+
+                if hasattr(embeddings, 'tolist'):
+                    return embeddings.tolist()
+                return embeddings
+            else:
+                # sentence-transformers fallback
+                embeddings = model.encode(
+                    input,
+                    show_progress_bar=False,
+                    convert_to_numpy=True,
+                    normalize_embeddings=True,
+                )
+                return embeddings.tolist()
+        except Exception as e:
+            logger.error(f"BGE-M3 embedding failed: {e}")
+            raise
+
+
 def get_embedding_function() -> embedding_functions.EmbeddingFunction:
     """Get embedding function based on environment configuration."""
     backend = EMBED_BACKEND
+
+    if backend == "bge-m3":
+        logger.info(f"Using BGE-M3 embedding backend: {BGE_M3_MODEL_PATH}")
+        return BGEM3EmbeddingFunction(model_path=BGE_M3_MODEL_PATH)
 
     if backend == "lmstudio":
         logger.info(f"Using LM Studio embedding backend: url={LMSTUDIO_BASE_URL} model={LMSTUDIO_EMBED_MODEL}")
@@ -607,39 +729,84 @@ def get_embedding_function() -> embedding_functions.EmbeddingFunction:
         logger.info(f"Using Ollama backend: model={OLLAMA_EMBED_MODEL} base_url={OLLAMA_BASE_URL}")
         return OllamaEmbeddingFunction(model=OLLAMA_EMBED_MODEL, base_url=OLLAMA_BASE_URL)
 
-    raise ValueError(f"Unknown EMBED_BACKEND={backend!r}. Expected 'lmstudio', 'hf', or 'ollama'.")
+    raise ValueError(f"Unknown EMBED_BACKEND={backend!r}. Expected 'bge-m3', 'lmstudio', 'hf', or 'ollama'.")
 
 
 # ---------------------------------------------------------------------------
-# Reranking
+# Reranking with BGE-Reranker-v2-M3
 # ---------------------------------------------------------------------------
 
 _RERANKER = None
+_RERANKER_TYPE = None  # "bge" or "cross-encoder"
 
 
 def _get_reranker():
-    """Get or create cross-encoder reranker."""
-    global _RERANKER
+    """Get or create reranker, preferring BGE-Reranker-v2-M3."""
+    global _RERANKER, _RERANKER_TYPE
 
     if not RERANK_ENABLED:
         return None
 
-    if _RERANKER is None:
-        try:
-            from sentence_transformers import CrossEncoder
-            logger.info("Loading cross-encoder: cross-encoder/ms-marco-MiniLM-L-6-v2")
-            _RERANKER = CrossEncoder(
-                "cross-encoder/ms-marco-MiniLM-L-6-v2",
-                max_length=512,
-            )
-        except ImportError:
-            logger.warning("sentence-transformers not installed. Reranking disabled.")
-            return None
-        except Exception as e:
-            logger.warning(f"Failed to load reranker: {e}")
-            return None
+    if _RERANKER is not None:
+        return _RERANKER
 
-    return _RERANKER
+    # Try BGE Reranker first (best quality)
+    try:
+        from FlagEmbedding import FlagReranker
+        import torch
+
+        device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+        logger.info(f"Loading BGE-Reranker-v2-M3 from: {BGE_RERANKER_MODEL_PATH} on {device}")
+
+        _RERANKER = FlagReranker(
+            BGE_RERANKER_MODEL_PATH,
+            use_fp16=(device != "cpu"),
+            device=device,
+        )
+        _RERANKER_TYPE = "bge"
+        logger.info("BGE-Reranker-v2-M3 loaded successfully")
+        return _RERANKER
+    except ImportError:
+        logger.info("FlagEmbedding not available, trying sentence-transformers CrossEncoder...")
+    except Exception as e:
+        logger.warning(f"Failed to load BGE reranker: {e}. Trying CrossEncoder fallback...")
+
+    # Fallback to CrossEncoder
+    try:
+        from sentence_transformers import CrossEncoder
+        import torch
+
+        device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+
+        # Try loading local BGE reranker as CrossEncoder
+        try:
+            logger.info(f"Trying to load BGE reranker via CrossEncoder: {BGE_RERANKER_MODEL_PATH}")
+            _RERANKER = CrossEncoder(
+                BGE_RERANKER_MODEL_PATH,
+                max_length=512,
+                device=device,
+            )
+            _RERANKER_TYPE = "cross-encoder"
+            logger.info("BGE reranker loaded via CrossEncoder")
+            return _RERANKER
+        except Exception:
+            pass
+
+        # Final fallback to ms-marco
+        logger.info("Loading fallback cross-encoder: cross-encoder/ms-marco-MiniLM-L-6-v2")
+        _RERANKER = CrossEncoder(
+            "cross-encoder/ms-marco-MiniLM-L-6-v2",
+            max_length=512,
+            device=device,
+        )
+        _RERANKER_TYPE = "cross-encoder"
+        return _RERANKER
+    except ImportError:
+        logger.warning("sentence-transformers not installed. Reranking disabled.")
+        return None
+    except Exception as e:
+        logger.warning(f"Failed to load reranker: {e}")
+        return None
 
 
 def rerank_results(
@@ -651,7 +818,7 @@ def rerank_results(
     top_k: int,
     min_score: float = MIN_RERANK_SCORE,
 ) -> Tuple[List[str], List[str], List[Dict[str, Any]], List[float]]:
-    """Rerank results using cross-encoder."""
+    """Rerank results using BGE-Reranker or CrossEncoder."""
     reranker = _get_reranker()
 
     if reranker is None or len(ids) == 0:
@@ -660,10 +827,20 @@ def rerank_results(
     if len(ids) <= top_k:
         return ids, docs, metas, dists if dists else []
 
-    pairs = [(query, doc) for doc in docs]
-
     try:
-        scores = reranker.predict(pairs)
+        if _RERANKER_TYPE == "bge":
+            # BGE FlagReranker uses compute_score
+            pairs = [[query, doc] for doc in docs]
+            scores = reranker.compute_score(pairs, normalize=True)
+            if not isinstance(scores, list):
+                scores = [scores]
+        else:
+            # CrossEncoder uses predict
+            pairs = [(query, doc) for doc in docs]
+            scores = reranker.predict(pairs)
+            if not hasattr(scores, '__iter__'):
+                scores = [scores]
+            scores = list(scores)
     except Exception as e:
         logger.warning(f"Reranking failed: {e}. Returning unranked results.")
         return ids[:top_k], docs[:top_k], metas[:top_k], dists[:top_k] if dists else []
@@ -692,6 +869,277 @@ def rerank_results(
         [r[1] for r in ranked],
         [r[2] for r in ranked],
         [float(r[3]) for r in ranked],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Diversification Functions
+# ---------------------------------------------------------------------------
+
+def diversify_by_section(
+    ids: List[str],
+    docs: List[str],
+    metas: List[Dict[str, Any]],
+    scores: List[float],
+    max_per_section: int = MAX_RESULTS_PER_SECTION,
+) -> Tuple[List[str], List[str], List[Dict[str, Any]], List[float]]:
+    """
+    Diversify results by section type.
+
+    Ensures variety across different section types (detection, mitigation, etc.)
+    while maintaining relevance order within each section.
+    """
+    if not DIVERSIFICATION_ENABLED:
+        return ids, docs, metas, scores
+
+    section_counts: Dict[str, int] = {}
+    kept_indices: List[int] = []
+
+    for i, meta in enumerate(metas):
+        section = (meta or {}).get("section", "unknown")
+        current_count = section_counts.get(section, 0)
+
+        if current_count < max_per_section:
+            kept_indices.append(i)
+            section_counts[section] = current_count + 1
+
+    if not kept_indices:
+        return ids, docs, metas, scores
+
+    return (
+        [ids[i] for i in kept_indices],
+        [docs[i] for i in kept_indices],
+        [metas[i] for i in kept_indices],
+        [scores[i] for i in kept_indices] if scores else [],
+    )
+
+
+def diversify_by_technique(
+    ids: List[str],
+    docs: List[str],
+    metas: List[Dict[str, Any]],
+    scores: List[float],
+    max_per_technique: int = MAX_RESULTS_PER_TECHNIQUE,
+) -> Tuple[List[str], List[str], List[Dict[str, Any]], List[float]]:
+    """
+    Diversify results by technique ID.
+
+    Limits results per technique to improve coverage across different techniques.
+    """
+    if not DIVERSIFICATION_ENABLED:
+        return ids, docs, metas, scores
+
+    technique_counts: Dict[str, int] = {}
+    kept_indices: List[int] = []
+
+    for i, meta in enumerate(metas):
+        technique_id = (meta or {}).get("technique_id", "unknown")
+        current_count = technique_counts.get(technique_id, 0)
+
+        if current_count < max_per_technique:
+            kept_indices.append(i)
+            technique_counts[technique_id] = current_count + 1
+
+    if not kept_indices:
+        return ids, docs, metas, scores
+
+    return (
+        [ids[i] for i in kept_indices],
+        [docs[i] for i in kept_indices],
+        [metas[i] for i in kept_indices],
+        [scores[i] for i in kept_indices] if scores else [],
+    )
+
+
+def apply_diversification(
+    ids: List[str],
+    docs: List[str],
+    metas: List[Dict[str, Any]],
+    scores: List[float],
+    top_k: int,
+    max_per_technique: int = MAX_RESULTS_PER_TECHNIQUE,
+    max_per_section: int = MAX_RESULTS_PER_SECTION,
+) -> Tuple[List[str], List[str], List[Dict[str, Any]], List[float]]:
+    """
+    Apply both technique and section diversification.
+
+    First diversifies by technique, then by section, to maximize coverage.
+    """
+    if not DIVERSIFICATION_ENABLED:
+        return ids[:top_k], docs[:top_k], metas[:top_k], scores[:top_k] if scores else []
+
+    # First pass: diversify by technique
+    ids, docs, metas, scores = diversify_by_technique(
+        ids, docs, metas, scores, max_per_technique
+    )
+
+    # Second pass: diversify by section
+    ids, docs, metas, scores = diversify_by_section(
+        ids, docs, metas, scores, max_per_section
+    )
+
+    return ids[:top_k], docs[:top_k], metas[:top_k], scores[:top_k] if scores else []
+
+
+# ---------------------------------------------------------------------------
+# MMR (Maximum Marginal Relevance)
+# ---------------------------------------------------------------------------
+
+def compute_mmr(
+    query_embedding: List[float],
+    doc_embeddings: List[List[float]],
+    ids: List[str],
+    docs: List[str],
+    metas: List[Dict[str, Any]],
+    scores: List[float],
+    top_k: int,
+    lambda_param: float = MMR_LAMBDA,
+) -> Tuple[List[str], List[str], List[Dict[str, Any]], List[float]]:
+    """
+    Apply Maximum Marginal Relevance for diversity-aware retrieval.
+
+    MMR balances relevance to the query with diversity among selected documents.
+    lambda_param controls the trade-off:
+    - lambda=1.0: pure relevance (no diversity)
+    - lambda=0.0: pure diversity (no relevance)
+    - lambda=0.7: balanced toward relevance (recommended)
+    """
+    if not MMR_ENABLED or len(ids) <= top_k:
+        return ids[:top_k], docs[:top_k], metas[:top_k], scores[:top_k] if scores else []
+
+    import numpy as np
+
+    query_emb = np.array(query_embedding)
+    doc_embs = np.array(doc_embeddings)
+
+    # Normalize embeddings for cosine similarity
+    query_norm = query_emb / (np.linalg.norm(query_emb) + 1e-9)
+    doc_norms = doc_embs / (np.linalg.norm(doc_embs, axis=1, keepdims=True) + 1e-9)
+
+    # Compute relevance scores (cosine similarity to query)
+    relevance_scores = np.dot(doc_norms, query_norm)
+
+    selected_indices: List[int] = []
+    remaining_indices = list(range(len(ids)))
+
+    while len(selected_indices) < top_k and remaining_indices:
+        best_score = -float('inf')
+        best_idx = None
+
+        for idx in remaining_indices:
+            # Relevance term
+            relevance = relevance_scores[idx]
+
+            # Diversity term: max similarity to already selected docs
+            if selected_indices:
+                similarities_to_selected = [
+                    np.dot(doc_norms[idx], doc_norms[sel_idx])
+                    for sel_idx in selected_indices
+                ]
+                max_sim_to_selected = max(similarities_to_selected)
+            else:
+                max_sim_to_selected = 0.0
+
+            # MMR score
+            mmr_score = lambda_param * relevance - (1 - lambda_param) * max_sim_to_selected
+
+            if mmr_score > best_score:
+                best_score = mmr_score
+                best_idx = idx
+
+        if best_idx is not None:
+            selected_indices.append(best_idx)
+            remaining_indices.remove(best_idx)
+
+    return (
+        [ids[i] for i in selected_indices],
+        [docs[i] for i in selected_indices],
+        [metas[i] for i in selected_indices],
+        [scores[i] for i in selected_indices] if scores else [],
+    )
+
+
+def apply_mmr_if_enabled(
+    query: str,
+    ids: List[str],
+    docs: List[str],
+    metas: List[Dict[str, Any]],
+    scores: List[float],
+    top_k: int,
+) -> Tuple[List[str], List[str], List[Dict[str, Any]], List[float]]:
+    """
+    Apply MMR if enabled, using the embedding function to get embeddings.
+    """
+    if not MMR_ENABLED or len(ids) <= top_k:
+        return ids[:top_k], docs[:top_k], metas[:top_k], scores[:top_k] if scores else []
+
+    try:
+        embed_fn = _cached_embed_fn()
+
+        # Get query embedding
+        query_embedding = embed_fn([query])[0]
+
+        # Get document embeddings
+        doc_embeddings = embed_fn(docs)
+
+        return compute_mmr(
+            query_embedding=query_embedding,
+            doc_embeddings=doc_embeddings,
+            ids=ids,
+            docs=docs,
+            metas=metas,
+            scores=scores,
+            top_k=top_k,
+        )
+    except Exception as e:
+        logger.warning(f"MMR failed: {e}. Returning results without MMR.")
+        return ids[:top_k], docs[:top_k], metas[:top_k], scores[:top_k] if scores else []
+
+
+# ---------------------------------------------------------------------------
+# Quality Filtering
+# ---------------------------------------------------------------------------
+
+def filter_by_similarity(
+    ids: List[str],
+    docs: List[str],
+    metas: List[Dict[str, Any]],
+    dists: List[float],
+    min_similarity: float = MIN_SEMANTIC_SIMILARITY,
+) -> Tuple[List[str], List[str], List[Dict[str, Any]], List[float]]:
+    """
+    Filter results by minimum similarity threshold.
+
+    Assumes distances are cosine distances (1 - similarity) or similarity scores.
+    """
+    if not dists:
+        return ids, docs, metas, dists
+
+    # Determine if dists are similarities (0-1, higher=better) or distances (0-2, lower=better)
+    avg_dist = sum(dists) / len(dists) if dists else 0
+
+    kept_indices = []
+    if avg_dist <= 1.0:
+        # Likely similarity scores (higher = better)
+        for i, dist in enumerate(dists):
+            if dist >= min_similarity:
+                kept_indices.append(i)
+    else:
+        # Likely distance scores (lower = better), convert threshold
+        max_distance = 1.0 - min_similarity
+        for i, dist in enumerate(dists):
+            if dist <= max_distance:
+                kept_indices.append(i)
+
+    if not kept_indices:
+        # Don't filter everything out, return top result at minimum
+        return ids[:1], docs[:1], metas[:1], dists[:1]
+
+    return (
+        [ids[i] for i in kept_indices],
+        [docs[i] for i in kept_indices],
+        [metas[i] for i in kept_indices],
+        [dists[i] for i in kept_indices],
     )
 
 
@@ -1043,8 +1491,21 @@ def search_chunks(
     tactic_id: Optional[str] = None,
     use_rerank: bool = True,
     use_expansion: bool = True,
+    use_mmr: bool = True,
+    use_diversification: bool = True,
 ) -> Dict[str, Any]:
-    """Enhanced semantic query with optional reranking and query expansion."""
+    """
+    Enhanced semantic query with reranking, MMR, and diversification.
+
+    Pipeline:
+    1. Query expansion (MITRE-specific synonyms)
+    2. Semantic search (ChromaDB with BGE-M3 embeddings)
+    3. Post-filtering (data components, log sources, tactics)
+    4. Quality filtering (minimum similarity threshold)
+    5. Reranking (BGE-Reranker-v2-M3)
+    6. Diversification (by technique and section)
+    7. MMR (Maximum Marginal Relevance for final diversity)
+    """
     ds = normalize_dataset(dataset)
     where_norm = normalize_where(where)
     inc = include or ["documents", "metadatas", "distances"]
@@ -1054,7 +1515,9 @@ def search_chunks(
 
     expanded_query = expand_query(query) if use_expansion else query
     collection = get_collection(dataset=ds, with_embed=True)
-    prefetch = max(int(k) * 3, PREFETCH_K) if (use_rerank and RERANK_ENABLED) else max(int(k), PREFETCH_K)
+
+    # Increase prefetch for better reranking pool
+    prefetch = max(int(k) * 5, PREFETCH_K) if (use_rerank and RERANK_ENABLED) else max(int(k) * 2, PREFETCH_K)
 
     try:
         raw = collection.query(
@@ -1067,6 +1530,7 @@ def search_chunks(
         logger.error(f"Chroma query failed: {e}")
         raise
 
+    # Step 1: Apply dataset-specific post-filters
     if ds == "mitre":
         filtered = _filter_mitre_result(raw, dc=dc, logsource=logsource, tactic_id=tactic_id)
     elif ds == "d3fend":
@@ -1079,8 +1543,32 @@ def search_chunks(
     metas = filtered.get("metadatas", [[]])[0]
     dists = filtered.get("distances", [[]])[0] if filtered.get("distances") else []
 
+    if not ids:
+        return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
+
+    # Step 2: Quality filtering (remove low-similarity results)
+    ids, docs, metas, dists = filter_by_similarity(ids, docs, metas, dists)
+
+    # Step 3: Reranking with BGE-Reranker
     if use_rerank and RERANK_ENABLED and len(ids) > k:
-        ids, docs, metas, dists = rerank_results(query, ids, docs, metas, dists, k)
+        # Get more results for diversification
+        rerank_k = min(len(ids), k * 3)
+        ids, docs, metas, dists = rerank_results(query, ids, docs, metas, dists, rerank_k)
+
+    # Step 4: Diversification (by technique and section)
+    if use_diversification and DIVERSIFICATION_ENABLED and len(ids) > k:
+        ids, docs, metas, dists = apply_diversification(
+            ids, docs, metas, dists,
+            top_k=k * 2,  # Keep extra for MMR
+            max_per_technique=MAX_RESULTS_PER_TECHNIQUE,
+            max_per_section=MAX_RESULTS_PER_SECTION,
+        )
+
+    # Step 5: MMR for final diversity-aware selection
+    if use_mmr and MMR_ENABLED and len(ids) > k:
+        ids, docs, metas, dists = apply_mmr_if_enabled(
+            query, ids, docs, metas, dists, top_k=k
+        )
     else:
         ids, docs, metas, dists = ids[:k], docs[:k], metas[:k], dists[:k] if dists else []
 
@@ -1247,26 +1735,48 @@ def search_chunks_enhanced(
     where: Optional[Dict[str, Any]] = None,
     **kwargs,
 ) -> Dict[str, Any]:
-    """Full enhanced search: hybrid + reranking."""
+    """
+    Full enhanced search: hybrid + reranking + diversification + MMR.
+
+    This is the recommended search function for production use.
+    """
     if HYBRID_ENABLED:
-        result = hybrid_search(dataset=dataset, query=query, k=k * 2, where=where)
+        # Hybrid search with increased prefetch
+        result = hybrid_search(dataset=dataset, query=query, k=k * 4, where=where)
 
-        if RERANK_ENABLED:
-            ids = result.get("ids", [[]])[0]
-            docs = result.get("documents", [[]])[0]
-            metas = result.get("metadatas", [[]])[0]
-            dists = result.get("distances", [[]])[0]
+        ids = result.get("ids", [[]])[0]
+        docs = result.get("documents", [[]])[0]
+        metas = result.get("metadatas", [[]])[0]
+        dists = result.get("distances", [[]])[0]
 
-            ids, docs, metas, dists = rerank_results(query, ids, docs, metas, dists, k)
+        if not ids:
+            return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
 
-            return {
-                "ids": [ids],
-                "documents": [docs],
-                "metadatas": [metas],
-                "distances": [dists],
-            }
+        # Quality filtering
+        ids, docs, metas, dists = filter_by_similarity(ids, docs, metas, dists)
 
-        return result
+        # Reranking
+        if RERANK_ENABLED and len(ids) > k:
+            ids, docs, metas, dists = rerank_results(query, ids, docs, metas, dists, k * 3)
+
+        # Diversification
+        if DIVERSIFICATION_ENABLED and len(ids) > k:
+            ids, docs, metas, dists = apply_diversification(
+                ids, docs, metas, dists, top_k=k * 2
+            )
+
+        # MMR for final selection
+        if MMR_ENABLED and len(ids) > k:
+            ids, docs, metas, dists = apply_mmr_if_enabled(query, ids, docs, metas, dists, k)
+        else:
+            ids, docs, metas, dists = ids[:k], docs[:k], metas[:k], dists[:k] if dists else []
+
+        return {
+            "ids": [ids],
+            "documents": [docs],
+            "metadatas": [metas],
+            "distances": [dists] if dists else [[]],
+        }
 
     return search_chunks(dataset=dataset, query=query, k=k, where=where, **kwargs)
 
