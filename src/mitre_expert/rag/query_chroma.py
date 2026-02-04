@@ -1227,13 +1227,14 @@ def filter_by_semantic_distance(
             kept_indices.append(i)
 
     if not kept_indices:
-        # Don't filter everything out - return top results sorted by distance
-        # Find the indices with lowest distances
+        # Don't filter everything out - return all results sorted by distance
+        # Let downstream k-selection handle the limit
         sorted_indices = sorted(range(len(semantic_distances)), key=lambda i: semantic_distances[i])
-        kept_indices = sorted_indices[:min(3, len(sorted_indices))]  # Keep at least top 3
+        kept_indices = sorted_indices  # Keep all, sorted by best distance
         logger.warning(
             f"All results filtered out by min_similarity={min_similarity} (max_dist={max_distance:.2f}). "
-            f"Keeping top {len(kept_indices)} results. Best distance: {semantic_distances[kept_indices[0]]:.4f}"
+            f"Bypassing filter, returning {len(kept_indices)} results sorted by distance. "
+            f"Best distance: {semantic_distances[kept_indices[0]]:.4f}"
         )
 
     return (
