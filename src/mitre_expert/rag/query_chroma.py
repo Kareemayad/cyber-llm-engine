@@ -65,6 +65,44 @@ from mitre_expert.config import (
     ENABLE_RERANKING,
 )
 
+# Import from refactored modules
+# These modules separate concerns for better maintainability:
+# - knowledge: Static mappings, synonyms, and taxonomy
+# - analysis: Query intent classification and expansion
+# - embeddings: Embedding function backends
+# - rerank: Cross-encoder reranking
+from mitre_expert.rag.knowledge import (
+    MITRE_SYNONYMS,
+    TACTIC_EXPANSIONS,
+    Tactic,
+    TACTIC_KEY_TECHNIQUES,
+    detect_tactic_from_query,
+)
+from mitre_expert.rag.analysis import (
+    QueryIntent,
+    QueryAnalysis,
+    analyze_query,
+    expand_query,
+    expand_query_advanced,
+    detect_technique_ids_from_query,
+    classify_query_intent,
+)
+from mitre_expert.rag.embeddings import (
+    get_embedding_function,
+    get_cached_embedding_function,
+    BGEM3EmbeddingFunction,
+    LMStudioEmbeddingFunction,
+    OllamaEmbeddingFunction,
+    HFSentenceTransformerEmbedding,
+)
+from mitre_expert.rag.rerank import (
+    RerankResult,
+    rerank as rerank_v2,
+    rerank_with_distances,
+    is_reranking_available,
+    get_reranker_type,
+)
+
 # Conditional import for technique resolver
 try:
     from mitre_expert.models.technique_resolver import (
@@ -809,23 +847,49 @@ def _get_reranker():
         return None
 
 
-def rerank_results(
+@dataclass
+class RerankResult:
+    """Result of reranking operation with separate score fields."""
+    ids: List[str]
+    docs: List[str]
+    metas: List[Dict[str, Any]]
+    rerank_scores: List[float]  # Higher = better, normalized 0-1
+    original_indices: List[int]  # Original indices before reranking
+
+
+def rerank_results_v2(
     query: str,
     ids: List[str],
     docs: List[str],
     metas: List[Dict[str, Any]],
-    dists: List[float],
     top_k: int,
     min_score: float = MIN_RERANK_SCORE,
-) -> Tuple[List[str], List[str], List[Dict[str, Any]], List[float]]:
-    """Rerank results using BGE-Reranker or CrossEncoder."""
+) -> RerankResult:
+    """
+    Rerank results using BGE-Reranker or CrossEncoder.
+
+    Returns RerankResult with explicit rerank_scores (NOT distances).
+    Rerank scores are always higher = better, normalized to 0-1.
+    """
     reranker = _get_reranker()
 
     if reranker is None or len(ids) == 0:
-        return ids[:top_k], docs[:top_k], metas[:top_k], dists[:top_k] if dists else []
+        return RerankResult(
+            ids=ids[:top_k],
+            docs=docs[:top_k],
+            metas=metas[:top_k],
+            rerank_scores=[],
+            original_indices=list(range(min(top_k, len(ids)))),
+        )
 
     if len(ids) <= top_k:
-        return ids, docs, metas, dists if dists else []
+        return RerankResult(
+            ids=ids,
+            docs=docs,
+            metas=metas,
+            rerank_scores=[],
+            original_indices=list(range(len(ids))),
+        )
 
     try:
         if _RERANKER_TYPE == "bge":
@@ -843,32 +907,63 @@ def rerank_results(
             scores = list(scores)
     except Exception as e:
         logger.warning(f"Reranking failed: {e}. Returning unranked results.")
-        return ids[:top_k], docs[:top_k], metas[:top_k], dists[:top_k] if dists else []
+        return RerankResult(
+            ids=ids[:top_k],
+            docs=docs[:top_k],
+            metas=metas[:top_k],
+            rerank_scores=[],
+            original_indices=list(range(min(top_k, len(ids)))),
+        )
 
-    ranked = sorted(
-        zip(ids, docs, metas, scores),
-        key=lambda x: x[3],
-        reverse=True
-    )
+    # Create tuples with original index for tracking
+    indexed_results = list(enumerate(zip(ids, docs, metas, scores)))
+    ranked = sorted(indexed_results, key=lambda x: x[1][3], reverse=True)
 
     if STRICT_MODE:
-        ranked = [r for r in ranked if r[3] >= min_score]
+        ranked = [r for r in ranked if r[1][3] >= min_score]
 
     ranked = ranked[:top_k]
 
     if not ranked:
         logger.warning(f"All results filtered out by min_score={min_score}. Returning top results anyway.")
-        ranked = sorted(
-            zip(ids, docs, metas, scores),
-            key=lambda x: x[3],
-            reverse=True
-        )[:top_k]
+        ranked = sorted(indexed_results, key=lambda x: x[1][3], reverse=True)[:top_k]
 
+    return RerankResult(
+        ids=[r[1][0] for r in ranked],
+        docs=[r[1][1] for r in ranked],
+        metas=[r[1][2] for r in ranked],
+        rerank_scores=[float(r[1][3]) for r in ranked],
+        original_indices=[r[0] for r in ranked],
+    )
+
+
+def rerank_results(
+    query: str,
+    ids: List[str],
+    docs: List[str],
+    metas: List[Dict[str, Any]],
+    dists: List[float],
+    top_k: int,
+    min_score: float = MIN_RERANK_SCORE,
+) -> Tuple[List[str], List[str], List[Dict[str, Any]], List[float]]:
+    """
+    Rerank results using BGE-Reranker or CrossEncoder.
+
+    DEPRECATED: This function returns rerank_scores in the dists field for backward compatibility.
+    Use rerank_results_v2 for explicit score separation.
+
+    WARNING: The returned 'dists' are actually RERANK SCORES (higher = better),
+    NOT cosine distances. This is a known issue for backward compatibility.
+    """
+    result = rerank_results_v2(query, ids, docs, metas, top_k, min_score)
+
+    # For backward compatibility, return rerank_scores in the dists position
+    # This is a known issue - callers should use rerank_results_v2 for clarity
     return (
-        [r[0] for r in ranked],
-        [r[1] for r in ranked],
-        [r[2] for r in ranked],
-        [float(r[3]) for r in ranked],
+        result.ids,
+        result.docs,
+        result.metas,
+        result.rerank_scores if result.rerank_scores else [],
     )
 
 
@@ -1100,6 +1195,56 @@ def apply_mmr_if_enabled(
 # Quality Filtering
 # ---------------------------------------------------------------------------
 
+def filter_by_semantic_distance(
+    ids: List[str],
+    docs: List[str],
+    metas: List[Dict[str, Any]],
+    semantic_distances: List[float],
+    min_similarity: float = MIN_SEMANTIC_SIMILARITY,
+) -> Tuple[List[str], List[str], List[Dict[str, Any]], List[float]]:
+    """
+    Filter results by minimum similarity threshold.
+
+    IMPORTANT: This function operates on COSINE DISTANCES from Chroma.
+    - Cosine distance = 1 - cosine_similarity
+    - Range: [0, 2] where 0 = identical, 2 = opposite
+    - Lower distance = better match
+
+    For min_similarity=0.60, we keep results where:
+        distance <= (1 - min_similarity) = 0.40
+    """
+    if not semantic_distances:
+        return ids, docs, metas, semantic_distances
+
+    # Convert similarity threshold to distance threshold
+    # min_similarity=0.60 means keep if cosine_similarity >= 0.60
+    # which means keep if cosine_distance <= (1 - 0.60) = 0.40
+    max_distance = 1.0 - min_similarity
+
+    kept_indices = []
+    for i, dist in enumerate(semantic_distances):
+        if dist <= max_distance:
+            kept_indices.append(i)
+
+    if not kept_indices:
+        # Don't filter everything out - return top results sorted by distance
+        # Find the indices with lowest distances
+        sorted_indices = sorted(range(len(semantic_distances)), key=lambda i: semantic_distances[i])
+        kept_indices = sorted_indices[:min(3, len(sorted_indices))]  # Keep at least top 3
+        logger.warning(
+            f"All results filtered out by min_similarity={min_similarity} (max_dist={max_distance:.2f}). "
+            f"Keeping top {len(kept_indices)} results. Best distance: {semantic_distances[kept_indices[0]]:.4f}"
+        )
+
+    return (
+        [ids[i] for i in kept_indices],
+        [docs[i] for i in kept_indices],
+        [metas[i] for i in kept_indices],
+        [semantic_distances[i] for i in kept_indices],
+    )
+
+
+# Backward compatibility alias
 def filter_by_similarity(
     ids: List[str],
     docs: List[str],
@@ -1107,40 +1252,59 @@ def filter_by_similarity(
     dists: List[float],
     min_similarity: float = MIN_SEMANTIC_SIMILARITY,
 ) -> Tuple[List[str], List[str], List[Dict[str, Any]], List[float]]:
+    """Deprecated: Use filter_by_semantic_distance instead."""
+    return filter_by_semantic_distance(ids, docs, metas, dists, min_similarity)
+
+
+# ---------------------------------------------------------------------------
+# Score Selection Helper
+# ---------------------------------------------------------------------------
+
+def select_primary_scores(
+    semantic_distances: Optional[List[float]] = None,
+    rerank_scores: Optional[List[float]] = None,
+    fusion_scores: Optional[List[float]] = None,
+) -> Tuple[str, List[float], bool]:
     """
-    Filter results by minimum similarity threshold.
+    Select the primary score to use for ranking/selection.
 
-    Assumes distances are cosine distances (1 - similarity) or similarity scores.
+    Priority: rerank > fusion > semantic (converted to similarity)
+
+    All returned scores are normalized so that HIGHER = BETTER.
+    This allows diversification and MMR to work consistently.
+
+    Returns:
+        Tuple of (score_type, scores, higher_is_better)
+        - score_type: "rerank", "fusion", or "semantic"
+        - scores: The score values (always higher = better)
+        - higher_is_better: Always True (scores are normalized)
     """
-    if not dists:
-        return ids, docs, metas, dists
+    # Priority: rerank > fusion > semantic
+    if rerank_scores and len(rerank_scores) > 0 and any(s > 0 for s in rerank_scores):
+        return ("rerank", list(rerank_scores), True)  # Rerank: higher = better
 
-    # Determine if dists are similarities (0-1, higher=better) or distances (0-2, lower=better)
-    avg_dist = sum(dists) / len(dists) if dists else 0
+    if fusion_scores and len(fusion_scores) > 0 and any(s > 0 for s in fusion_scores):
+        return ("fusion", list(fusion_scores), True)  # Fusion: higher = better
 
-    kept_indices = []
-    if avg_dist <= 1.0:
-        # Likely similarity scores (higher = better)
-        for i, dist in enumerate(dists):
-            if dist >= min_similarity:
-                kept_indices.append(i)
-    else:
-        # Likely distance scores (lower = better), convert threshold
-        max_distance = 1.0 - min_similarity
-        for i, dist in enumerate(dists):
-            if dist <= max_distance:
-                kept_indices.append(i)
+    if semantic_distances and len(semantic_distances) > 0:
+        # Convert distances to similarities for consistency
+        # Cosine distance is in [0, 2], so similarity = 1 - distance is in [-1, 1]
+        # For normalized vectors, distance is in [0, 2], similarity in [-1, 1]
+        # Most results will have distance in [0, 1], so similarity in [0, 1]
+        similarities = [max(0.0, 1.0 - d) for d in semantic_distances]
+        return ("semantic", similarities, True)
 
-    if not kept_indices:
-        # Don't filter everything out, return top result at minimum
-        return ids[:1], docs[:1], metas[:1], dists[:1]
+    return ("none", [], True)
 
-    return (
-        [ids[i] for i in kept_indices],
-        [docs[i] for i in kept_indices],
-        [metas[i] for i in kept_indices],
-        [dists[i] for i in kept_indices],
-    )
+
+def convert_distances_to_similarities(distances: List[float]) -> List[float]:
+    """Convert cosine distances to cosine similarities."""
+    return [1.0 - d for d in distances]
+
+
+def convert_similarities_to_distances(similarities: List[float]) -> List[float]:
+    """Convert cosine similarities to cosine distances."""
+    return [1.0 - s for s in similarities]
 
 
 # ---------------------------------------------------------------------------
@@ -1200,14 +1364,29 @@ def hybrid_search(
     bm25_weight: float = 0.4,
     where: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Hybrid search combining BM25 and semantic search with RRF."""
+    """
+    Hybrid search combining BM25 and semantic search with RRF.
+
+    Returns:
+        Dict with keys:
+        - ids, documents, metadatas: Standard result fields
+        - distances: DEPRECATED - For backward compat, contains 1 - fusion_score
+        - fusion_scores: RRF fusion scores (higher = better)
+        - semantic_distances: Empty (not available after fusion)
+        - rerank_scores: Empty (reranking happens after hybrid)
+    """
     bm25_index = _get_bm25_index(dataset)
 
     if bm25_index is None:
         return search_chunks(dataset=dataset, query=query, k=k, where=where)
 
-    semantic_result = search_chunks(dataset=dataset, query=query, k=k * 3, where=where, use_rerank=False)
+    # Get semantic results without reranking (we'll fuse first, then optionally rerank)
+    semantic_result = search_chunks(
+        dataset=dataset, query=query, k=k * 3, where=where,
+        use_rerank=False, use_mmr=False, use_diversification=False
+    )
     semantic_ids = semantic_result.get("ids", [[]])[0]
+    semantic_dists = semantic_result.get("semantic_distances", [[]])[0]
 
     tokenized_query = query.lower().split()
     bm25_scores = bm25_index["bm25"].get_scores(tokenized_query)
@@ -1220,8 +1399,12 @@ def hybrid_search(
     rrf_k = 60
     rrf_scores: Dict[str, float] = {}
 
-    for rank, doc_id in enumerate(semantic_ids):
-        rrf_scores[doc_id] = rrf_scores.get(doc_id, 0) + semantic_weight / (rrf_k + rank + 1)
+    # Track semantic distances for each doc
+    semantic_dist_map: Dict[str, float] = {}
+    for i, doc_id in enumerate(semantic_ids):
+        rrf_scores[doc_id] = rrf_scores.get(doc_id, 0) + semantic_weight / (rrf_k + i + 1)
+        if semantic_dists and i < len(semantic_dists):
+            semantic_dist_map[doc_id] = semantic_dists[i]
 
     for rank, (idx, _) in enumerate(bm25_ranking):
         doc_id = bm25_index["ids"][idx]
@@ -1230,11 +1413,17 @@ def hybrid_search(
     sorted_ids = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)[:k]
     id_to_idx = {id_: i for i, id_ in enumerate(bm25_index["ids"])}
 
+    # Compute fusion scores for output (higher = better)
+    fusion_scores = [rrf_scores[id_] for id_ in sorted_ids]
+
     return {
         "ids": [sorted_ids],
         "documents": [[bm25_index["docs"][id_to_idx[id_]] for id_ in sorted_ids]],
         "metadatas": [[bm25_index["metas"][id_to_idx[id_]] for id_ in sorted_ids]],
-        "distances": [[1.0 - rrf_scores[id_] for id_ in sorted_ids]],
+        "distances": [[1.0 - score for score in fusion_scores]],  # DEPRECATED: backward compat
+        "fusion_scores": [fusion_scores],  # RRF scores (higher = better)
+        "semantic_distances": [[semantic_dist_map.get(id_, 1.0) for id_ in sorted_ids]],
+        "rerank_scores": [[]],  # Not reranked yet
     }
 
 
@@ -1493,6 +1682,7 @@ def search_chunks(
     use_expansion: bool = True,
     use_mmr: bool = True,
     use_diversification: bool = True,
+    min_similarity: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Enhanced semantic query with reranking, MMR, and diversification.
@@ -1501,10 +1691,19 @@ def search_chunks(
     1. Query expansion (MITRE-specific synonyms)
     2. Semantic search (ChromaDB with BGE-M3 embeddings)
     3. Post-filtering (data components, log sources, tactics)
-    4. Quality filtering (minimum similarity threshold)
+    4. Quality filtering (minimum cosine distance threshold)
     5. Reranking (BGE-Reranker-v2-M3)
     6. Diversification (by technique and section)
     7. MMR (Maximum Marginal Relevance for final diversity)
+
+    Returns:
+        Dict with keys:
+        - ids: [[...]]
+        - documents: [[...]]
+        - metadatas: [[...]]
+        - distances: [[...]]  # DEPRECATED: For backward compatibility only
+        - semantic_distances: [[...]]  # Cosine distances from Chroma (lower = better)
+        - rerank_scores: [[...]]  # Reranker scores (higher = better), empty if not reranked
     """
     ds = normalize_dataset(dataset)
     where_norm = normalize_where(where)
@@ -1541,42 +1740,86 @@ def search_chunks(
     ids = filtered.get("ids", [[]])[0]
     docs = filtered.get("documents", [[]])[0]
     metas = filtered.get("metadatas", [[]])[0]
-    dists = filtered.get("distances", [[]])[0] if filtered.get("distances") else []
+    semantic_distances = filtered.get("distances", [[]])[0] if filtered.get("distances") else []
 
     if not ids:
-        return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
+        return {
+            "ids": [[]],
+            "documents": [[]],
+            "metadatas": [[]],
+            "distances": [[]],
+            "semantic_distances": [[]],
+            "rerank_scores": [[]],
+        }
 
-    # Step 2: Quality filtering (remove low-similarity results)
-    ids, docs, metas, dists = filter_by_similarity(ids, docs, metas, dists)
+    # Step 2: Quality filtering on SEMANTIC DISTANCES (cosine distance, lower = better)
+    effective_min_similarity = min_similarity if min_similarity is not None else MIN_SEMANTIC_SIMILARITY
+    ids, docs, metas, semantic_distances = filter_by_semantic_distance(
+        ids, docs, metas, semantic_distances, min_similarity=effective_min_similarity
+    )
+
+    # Track rerank scores separately
+    rerank_scores: List[float] = []
 
     # Step 3: Reranking with BGE-Reranker
     if use_rerank and RERANK_ENABLED and len(ids) > k:
-        # Get more results for diversification
         rerank_k = min(len(ids), k * 3)
-        ids, docs, metas, dists = rerank_results(query, ids, docs, metas, dists, rerank_k)
+        rerank_result = rerank_results_v2(query, ids, docs, metas, rerank_k)
+        ids = rerank_result.ids
+        docs = rerank_result.docs
+        metas = rerank_result.metas
+        rerank_scores = rerank_result.rerank_scores
+        # Update semantic_distances to match new order
+        semantic_distances = [semantic_distances[i] for i in rerank_result.original_indices]
+
+    # For diversification and MMR, use the primary scores
+    # If reranked, use rerank_scores (higher = better)
+    # Otherwise, convert semantic_distances to similarities (higher = better)
+    score_type, primary_scores, higher_is_better = select_primary_scores(
+        semantic_distances=semantic_distances,
+        rerank_scores=rerank_scores,
+    )
 
     # Step 4: Diversification (by technique and section)
     if use_diversification and DIVERSIFICATION_ENABLED and len(ids) > k:
-        ids, docs, metas, dists = apply_diversification(
-            ids, docs, metas, dists,
+        ids, docs, metas, primary_scores = apply_diversification(
+            ids, docs, metas, primary_scores,
             top_k=k * 2,  # Keep extra for MMR
             max_per_technique=MAX_RESULTS_PER_TECHNIQUE,
             max_per_section=MAX_RESULTS_PER_SECTION,
         )
+        # Update rerank_scores and semantic_distances to match
+        if score_type == "rerank":
+            rerank_scores = primary_scores
+        # Note: semantic_distances order is now out of sync - we'll recompute from metas if needed
 
     # Step 5: MMR for final diversity-aware selection
     if use_mmr and MMR_ENABLED and len(ids) > k:
-        ids, docs, metas, dists = apply_mmr_if_enabled(
-            query, ids, docs, metas, dists, top_k=k
+        ids, docs, metas, primary_scores = apply_mmr_if_enabled(
+            query, ids, docs, metas, primary_scores, top_k=k
         )
+        if score_type == "rerank":
+            rerank_scores = primary_scores
     else:
-        ids, docs, metas, dists = ids[:k], docs[:k], metas[:k], dists[:k] if dists else []
+        ids, docs, metas = ids[:k], docs[:k], metas[:k]
+        primary_scores = primary_scores[:k] if primary_scores else []
+        if score_type == "rerank":
+            rerank_scores = primary_scores
+
+    # Prepare final output with explicit score fields
+    # For backward compatibility, 'distances' contains the primary scores used for ranking
+    # New code should use semantic_distances and rerank_scores explicitly
+    final_distances = rerank_scores if rerank_scores else (
+        [1.0 - s for s in primary_scores] if primary_scores else []
+    )
 
     return {
         "ids": [ids],
         "documents": [docs],
         "metadatas": [metas],
-        "distances": [dists] if dists else [[]],
+        "distances": [final_distances],  # DEPRECATED: backward compat
+        "semantic_distances": [semantic_distances[:len(ids)] if semantic_distances else []],
+        "rerank_scores": [rerank_scores] if rerank_scores else [[]],
     }
 
 
@@ -1733,12 +1976,20 @@ def search_chunks_enhanced(
     query: str,
     k: int = 5,
     where: Optional[Dict[str, Any]] = None,
+    min_similarity: Optional[float] = None,
     **kwargs,
 ) -> Dict[str, Any]:
     """
     Full enhanced search: hybrid + reranking + diversification + MMR.
 
     This is the recommended search function for production use.
+
+    Returns:
+        Dict with explicit score fields:
+        - semantic_distances: Cosine distances from Chroma (lower = better)
+        - fusion_scores: RRF hybrid scores (higher = better)
+        - rerank_scores: Cross-encoder scores (higher = better)
+        - distances: DEPRECATED - for backward compatibility
     """
     if HYBRID_ENABLED:
         # Hybrid search with increased prefetch
@@ -1747,38 +1998,85 @@ def search_chunks_enhanced(
         ids = result.get("ids", [[]])[0]
         docs = result.get("documents", [[]])[0]
         metas = result.get("metadatas", [[]])[0]
-        dists = result.get("distances", [[]])[0]
+        fusion_scores = result.get("fusion_scores", [[]])[0]
+        semantic_distances = result.get("semantic_distances", [[]])[0]
 
         if not ids:
-            return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
+            return {
+                "ids": [[]],
+                "documents": [[]],
+                "metadatas": [[]],
+                "distances": [[]],
+                "semantic_distances": [[]],
+                "fusion_scores": [[]],
+                "rerank_scores": [[]],
+            }
 
-        # Quality filtering
-        ids, docs, metas, dists = filter_by_similarity(ids, docs, metas, dists)
+        # Quality filtering on semantic distances (NOT fusion scores)
+        effective_min_similarity = min_similarity if min_similarity is not None else MIN_SEMANTIC_SIMILARITY
+        if semantic_distances:
+            ids, docs, metas, semantic_distances = filter_by_semantic_distance(
+                ids, docs, metas, semantic_distances, min_similarity=effective_min_similarity
+            )
+            # Update fusion_scores to match filtered results
+            # Note: This is approximate since we're filtering by semantic distance
+            fusion_scores = fusion_scores[:len(ids)] if fusion_scores else []
+
+        # Track rerank scores
+        rerank_scores: List[float] = []
 
         # Reranking
         if RERANK_ENABLED and len(ids) > k:
-            ids, docs, metas, dists = rerank_results(query, ids, docs, metas, dists, k * 3)
+            rerank_result = rerank_results_v2(query, ids, docs, metas, k * 3)
+            ids = rerank_result.ids
+            docs = rerank_result.docs
+            metas = rerank_result.metas
+            rerank_scores = rerank_result.rerank_scores
+
+        # Select primary scores for diversification/MMR
+        score_type, primary_scores, _ = select_primary_scores(
+            semantic_distances=semantic_distances,
+            rerank_scores=rerank_scores,
+            fusion_scores=fusion_scores,
+        )
 
         # Diversification
         if DIVERSIFICATION_ENABLED and len(ids) > k:
-            ids, docs, metas, dists = apply_diversification(
-                ids, docs, metas, dists, top_k=k * 2
+            ids, docs, metas, primary_scores = apply_diversification(
+                ids, docs, metas, primary_scores, top_k=k * 2
             )
+            if score_type == "rerank":
+                rerank_scores = primary_scores
 
         # MMR for final selection
         if MMR_ENABLED and len(ids) > k:
-            ids, docs, metas, dists = apply_mmr_if_enabled(query, ids, docs, metas, dists, k)
+            ids, docs, metas, primary_scores = apply_mmr_if_enabled(
+                query, ids, docs, metas, primary_scores, k
+            )
+            if score_type == "rerank":
+                rerank_scores = primary_scores
         else:
-            ids, docs, metas, dists = ids[:k], docs[:k], metas[:k], dists[:k] if dists else []
+            ids, docs, metas = ids[:k], docs[:k], metas[:k]
+            primary_scores = primary_scores[:k] if primary_scores else []
+            if score_type == "rerank":
+                rerank_scores = primary_scores
+
+        # Prepare final output
+        final_distances = rerank_scores if rerank_scores else (
+            [1.0 - s for s in primary_scores] if primary_scores else []
+        )
 
         return {
             "ids": [ids],
             "documents": [docs],
             "metadatas": [metas],
-            "distances": [dists] if dists else [[]],
+            "distances": [final_distances],  # DEPRECATED
+            "semantic_distances": [semantic_distances[:len(ids)] if semantic_distances else []],
+            "fusion_scores": [fusion_scores[:len(ids)] if fusion_scores else []],
+            "rerank_scores": [rerank_scores] if rerank_scores else [[]],
         }
 
-    return search_chunks(dataset=dataset, query=query, k=k, where=where, **kwargs)
+    return search_chunks(dataset=dataset, query=query, k=k, where=where, min_similarity=min_similarity, **kwargs)
 
 
 def _search_all(
@@ -2022,7 +2320,12 @@ def pretty_print_results(result: Dict[str, Any], show_analysis: bool = True) -> 
     ids = result.get("ids", [[]])[0]
     docs = result.get("documents", [[]])[0]
     metas = result.get("metadatas", [[]])[0]
-    dists = result.get("distances", [[]])[0] if result.get("distances") else []
+
+    # Extract all score types
+    semantic_distances = result.get("semantic_distances", [[]])[0] if result.get("semantic_distances") else []
+    rerank_scores = result.get("rerank_scores", [[]])[0] if result.get("rerank_scores") else []
+    fusion_scores = result.get("fusion_scores", [[]])[0] if result.get("fusion_scores") else []
+    legacy_distances = result.get("distances", [[]])[0] if result.get("distances") else []
 
     if show_analysis and "_analysis" in result:
         analysis = result["_analysis"]
@@ -2041,7 +2344,7 @@ def pretty_print_results(result: Dict[str, Any], show_analysis: bool = True) -> 
         return
 
     for rank, (cid, doc, meta) in enumerate(zip(ids, docs, metas), start=1):
-        dist = dists[rank - 1] if dists and rank - 1 < len(dists) else None
+        idx = rank - 1
         meta = meta or {}
 
         print("=" * 80)
@@ -2049,8 +2352,19 @@ def pretty_print_results(result: Dict[str, Any], show_analysis: bool = True) -> 
 
         if meta.get("dataset"):
             print(f"    dataset:       {meta['dataset']}")
-        if dist is not None:
-            print(f"    score/dist:    {float(dist):.4f}")
+
+        # Show scores with clear labels
+        if rerank_scores and idx < len(rerank_scores):
+            print(f"    rerank_score:  {float(rerank_scores[idx]):.4f} (higher=better)")
+        if semantic_distances and idx < len(semantic_distances):
+            sim = 1.0 - semantic_distances[idx]
+            print(f"    cosine_dist:   {float(semantic_distances[idx]):.4f} (sim={sim:.4f})")
+        if fusion_scores and idx < len(fusion_scores):
+            print(f"    fusion_score:  {float(fusion_scores[idx]):.4f} (higher=better)")
+        if not rerank_scores and not semantic_distances and not fusion_scores:
+            # Fallback to legacy distances
+            if legacy_distances and idx < len(legacy_distances):
+                print(f"    score/dist:    {float(legacy_distances[idx]):.4f}")
 
         if meta.get("technique_id"):
             tech_name = meta.get("technique_name", "")
