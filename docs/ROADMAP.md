@@ -36,7 +36,7 @@ log_source_names (e.g. WinEventLog:Security, sysmon, azure:signinlogs)
 
 Section/type: description, procedure_example, mitigation, detection_strategy, etc.
 
-Embeddings & RAG
+Embeddings & RAG (V2 - Enhanced)
 
 index_chroma.py:
 
@@ -44,7 +44,23 @@ Reads mitre_chunks_v1.jsonl
 
 Builds a Chroma collection: mitre_chunks_v1 in data/embeddings/mitre/chroma
 
-Embedding backend: HF sentence-transformers or Ollama (config via env).
+Embedding backend: BGE-M3 (1024 dimensions, multilingual, 8192 token context)
+
+query_chroma.py (Enhanced):
+
+BGE-M3 embeddings for semantic search
+
+BGE-Reranker-v2-M3 for cross-encoder reranking
+
+Hybrid search (BM25 + semantic with RRF fusion)
+
+Quality filtering with minimum similarity threshold
+
+Section diversification (max 3 per section type)
+
+Technique diversification (max 2 per technique)
+
+MMR (Maximum Marginal Relevance) for diversity-aware selection
 
 query_chroma.py:
 
@@ -304,8 +320,63 @@ Routing path mapper_detect is defined in router.py.
 
 Glue logic (controller) to run Mapper then Detect and merge answers is not shown here but is straightforward to implement.
 
-2. Roadmap – How we improve & what data we’ll add
-Stage 0 – Current “MITRE-only” baseline (where we are)
+2. Roadmap – How we improve & what data we'll add
+
+Stage 0.5 – Enhanced RAG Pipeline (COMPLETED ✓)
+
+New capabilities added:
+
+BGE-M3 Embeddings:
+
+1024-dimensional multilingual embeddings
+
+8192 token context support
+
+Superior semantic understanding
+
+BGE-Reranker-v2-M3:
+
+Cross-encoder reranking for precision
+
+Scores query-document pairs together
+
+Normalized relevance scores
+
+Diversification:
+
+Technique diversity: max 2 results per technique
+
+Section diversity: max 3 results per section type
+
+Prevents redundant retrieval
+
+MMR (Maximum Marginal Relevance):
+
+Balances relevance and diversity
+
+Configurable lambda parameter (default: 0.7)
+
+Quality Filtering:
+
+Minimum similarity threshold (default: 0.60)
+
+Removes low-quality results
+
+Hybrid Search:
+
+BM25 + semantic search combination
+
+RRF (Reciprocal Rank Fusion) score merging
+
+Query Expansion:
+
+MITRE-specific synonyms
+
+Tactic term expansion
+
+Intent-aware keyword addition
+
+Stage 0 – Current "MITRE-only" baseline (where we are)
 
 Data we use:
 

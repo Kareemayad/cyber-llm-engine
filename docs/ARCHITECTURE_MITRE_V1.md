@@ -266,9 +266,31 @@ mitre_chunks_v1
 
 d3fend_chunks_v1
 
-6.2 Retrieval Modes
+6.2 Embedding Backend: BGE-M3
 
-The system supports two retrieval modes:
+The system uses BAAI/bge-m3 for embeddings:
+
+Model: BGE-M3 (BAAI/bge-m3)
+
+Dimensions: 1024
+
+Max Sequence Length: 8192 tokens
+
+Features: Dense, Sparse, ColBERT embeddings
+
+Why BGE-M3?
+
+Superior semantic understanding for cybersecurity content
+
+Multilingual support for international threat intelligence
+
+Long context support (8192 tokens)
+
+State-of-the-art performance on retrieval benchmarks
+
+6.3 Retrieval Modes
+
+The system supports multiple retrieval modes:
 
 Semantic Search
 
@@ -285,6 +307,80 @@ Used when:
 Technique ID and section are known
 
 Exact chunks must be retrieved (e.g. all mitigations)
+
+Smart Search (Intent-Aware)
+
+Used when:
+
+System needs to analyze query intent
+
+Tactic-broad queries need special handling
+
+Detection vs mitigation intent matters
+
+Enhanced Search (Full Pipeline)
+
+Full retrieval pipeline with:
+
+Hybrid search (BM25 + semantic)
+
+Quality filtering
+
+Reranking
+
+Diversification
+
+MMR selection
+
+6.4 Advanced RAG Pipeline
+
+The enhanced RAG pipeline includes:
+
+1. Query Analysis & Expansion
+
+Intent classification (detection, mitigation, procedure, etc.)
+
+Technique ID and tactic detection
+
+MITRE-specific synonym expansion
+
+2. Hybrid Search (Optional)
+
+Combines semantic search with BM25 keyword matching
+
+Reciprocal Rank Fusion (RRF) for score combination
+
+Default: 60% semantic, 40% BM25
+
+3. Quality Filtering
+
+Minimum similarity threshold (default: 0.60)
+
+Removes low-quality results before processing
+
+4. Cross-Encoder Reranking
+
+Uses BGE-Reranker-v2-M3 for precise scoring
+
+Cross-encoder sees query+document together
+
+Significantly improves precision@k
+
+5. Diversification
+
+Technique diversity: Max 2 results per technique (configurable)
+
+Section diversity: Max 3 results per section type
+
+Ensures variety in retrieved context
+
+6. MMR (Maximum Marginal Relevance)
+
+Balances relevance vs diversity in final selection
+
+Lambda parameter (default: 0.7) controls balance
+
+Prevents redundant results
 
 7. Runtime Architecture (FastAPI)
 7.1 API Entry Point
